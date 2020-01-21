@@ -37,7 +37,7 @@ static const struct buffer_desc buffers[] = {
 
 void iobuf_init_adc() {
   // Set up a level-triggered interrupt on INT0# pin.
-  PORTACFG |= _INT0;
+  //PORTACFG |= _INT0;
   TCON &= ~_IT0;
 }
 
