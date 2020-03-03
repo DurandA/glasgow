@@ -125,23 +125,30 @@ void fifo_reset(bool two_ep, uint8_t interfaces);
 #define SIGN_MODE_EXTERNAL          ((uint8_t)0x80)
 #define NONCE_MODE_TARGET_TEMPKEY       ((uint8_t)0x00)
 
-#define ATECC_BUFSIZE  67
+#define ATECC_BUFSIZE  (64+2)
 
-struct atecc_packet {
-  uint8_t w_addr;
-  uint8_t txsize;
-  uint8_t opcode;
-  uint8_t p1;
-  uint16_t p2;
+union atecc_packet {
+  struct {
+    uint8_t opcode;
+    uint8_t p1;
+    uint16_t p2;
+    uint8_t data[ATECC_BUFSIZE];
+  } command;
   uint8_t data[ATECC_BUFSIZE];
 };
 
-typedef __xdata struct atecc_packet
-  atecc_packet_t;
+struct atecc_io {
+  uint8_t w_addr;
+  uint8_t len;
+  union atecc_packet;
+};
 
-void atecc_init(atecc_packet_t *packet);
+typedef __xdata struct atecc_io
+  atecc_io_t;
+
+void atecc_init(atecc_io_t *packet);
 bool atecc_wake();
-bool atecc_nonce(atecc_packet_t *packet, __xdata const uint8_t *nonce);
-bool atecc_sign(atecc_packet_t *packet, uint16_t key_id, __xdata uint8_t *signature);
+bool atecc_nonce(atecc_io_t *packet, __xdata const uint8_t *nonce);
+bool atecc_sign(atecc_io_t *packet, uint16_t key_id, __xdata uint8_t *signature);
 
 #endif

@@ -181,7 +181,7 @@ usb_desc_ms_ext_compat_id_c usb_ms_ext_compat_id = {
   }
 };
 
-atecc_packet_t atecc_packet = {
+atecc_io_t atecc_packet = {
   .w_addr = 0x03,
 };
 
@@ -763,8 +763,6 @@ void handle_pending_usb_setup() {
       if(!atecc_sign(&atecc_packet, 0, EP0BUF)){
         STALL_EP0();
       } else {
-        xmemcpy(EP0BUF, &atecc_packet.data, 64);
-        //xmemcpy(EP0BUF, cert, 32);
         SETUP_EP0_BUF(64);
       }
     } else {

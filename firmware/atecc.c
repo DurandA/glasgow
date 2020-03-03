@@ -64,13 +64,13 @@ bool atecc_wake() {
   return success;
 }
 
-bool atecc_send(__xdata struct atecc_packet *packet)
+bool atecc_send(atecc_io_t *packet)
 {
   uint8_t* crc_dat = ((uint8_t *)packet)+1;
-  crc16(packet->txsize-2, crc_dat, crc_dat+packet->txsize-2);
+  crc16(packet->len-2, crc_dat, crc_dat+packet->len-2);
   if(!i2c_start(I2C_ADDR_ATECC<<1))
 		goto fail;
-  if(!i2c_write((uint8_t*)packet, packet->txsize+1))
+  if(!i2c_write((uint8_t*)packet, packet->len+1))
 		goto fail;
   if(!i2c_stop())
     return false;
@@ -80,12 +80,7 @@ fail:
   return false;
 }
 
-
-
-//#define PKT_CRC(buf, len) (htole16(*((uint16_t*)(buf+len-2))))
-
-//bool atecc_recv(uint8_t *data, uint16_t len/*, uint8_t buflen*/)
-bool atecc_recv(__xdata struct atecc_packet *packet, uint8_t rxsize) {
+bool atecc_recv(atecc_io_t *packet, uint8_t rxsize) {
   if(!i2c_start((I2C_ADDR_ATECC<<1)|1))
 		goto fail;
 	if(!i2c_read(((uint8_t*)packet)+1/*TODO start from packet.txsize*/, rxsize))
@@ -117,23 +112,23 @@ static void atecc_delay(uint8_t opcode)
 	delay_ms(delay);
 }
 
-bool atecc_send_recv(atecc_packet_t *packet, uint8_t rxsize)
+bool atecc_send_recv(atecc_io_t *packet, uint8_t rxsize)
 {
   if (!atecc_send(packet))
     return false;
-	atecc_delay(packet->opcode);
+	atecc_delay(packet->command.opcode);
   if (!atecc_recv(packet, rxsize))
     return false;
   return true;
 }
 
-bool atecc_nonce(atecc_packet_t *packet, __xdata const uint8_t *nonce)
+bool atecc_nonce(atecc_io_t *packet, __xdata const uint8_t *nonce)
 {
-  packet->opcode = ATECC_OP_NONCE;
-  packet->p1 = NONCE_MODE_PASSTHROUGH | NONCE_MODE_TARGET_TEMPKEY | NONCE_MODE_INPUT_LEN_32;
-  //packet->p2 = 0;
-  xmemcpy((__xdata void *)packet->data, (__xdata void *)nonce, 32);
-  packet->txsize = 39;
+  packet->command.opcode = ATECC_OP_NONCE;
+  packet->command.p1 = NONCE_MODE_PASSTHROUGH | NONCE_MODE_TARGET_TEMPKEY | NONCE_MODE_INPUT_LEN_32;
+  packet->command.p2 = 0;
+  xmemcpy((__xdata void *)packet->command.data, (__xdata void *)nonce, 32);
+  packet->len = 39;
 
   if (!atecc_send_recv(packet, 4))
     return false;
@@ -143,12 +138,12 @@ bool atecc_nonce(atecc_packet_t *packet, __xdata const uint8_t *nonce)
   return true;
 }
 
-bool atecc_sign(atecc_packet_t *packet, uint16_t key_id, /*__xdata uint8_t **signature*/__xdata uint8_t *signature)
+bool atecc_sign(atecc_io_t *packet, uint16_t key_id, /*__xdata uint8_t **signature*/__xdata uint8_t *signature)
 {
-  packet->opcode = ATECC_OP_SIGN;
-  packet->p1 = SIGN_MODE_EXTERNAL | SIGN_MODE_SOURCE_TEMPKEY;
-  packet->p2 = key_id;
-  packet->txsize = 7;
+  packet->command.opcode = ATECC_OP_SIGN;
+  packet->command.p1 = SIGN_MODE_EXTERNAL | SIGN_MODE_SOURCE_TEMPKEY;
+  packet->command.p2 = key_id;
+  packet->len = 7;
 
   if (!atecc_send_recv(packet, 67))
   {
@@ -161,11 +156,11 @@ bool atecc_sign(atecc_packet_t *packet, uint16_t key_id, /*__xdata uint8_t **sig
   /*i2c_start(I2C_ADDR_ATECC<<1);
   i2c_write((uint8_t*)packet->data, 64);
   i2c_stop();*/
-  //xmemcpy((__xdata void *)signature, (__xdata void *)packet->data, 64);
+  xmemcpy((__xdata void *)signature, (__xdata void *)packet->data, 64);
   return true;
 }
 
-void atecc_init(atecc_packet_t *packet){
+void atecc_init(atecc_io_t *packet){
   __xdata const uint8_t nonce[32] = { 0 };
   __xdata uint8_t signature[64];
 
