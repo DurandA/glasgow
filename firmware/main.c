@@ -181,6 +181,10 @@ usb_desc_ms_ext_compat_id_c usb_ms_ext_compat_id = {
   }
 };
 
+atecc_packet_t atecc_packet = {
+  .w_addr = 0x03,
+};
+
 void handle_usb_get_descriptor(enum usb_descriptor type, uint8_t index) {
   if(type == USB_DESC_STRING && index == 0xEE) {
     xmemcpy(scratch, (__xdata void *)&usb_microsoft, usb_microsoft.bLength);
@@ -284,6 +288,9 @@ enum {
   USB_REQ_LIBFX2_PAGE_SIZE  = 0xB0,
   // Microsoft requests
   USB_REQ_GET_MS_DESCRIPTOR = 0xC0,
+  // ATECC requests
+  USB_REQ_ATECC_SIGN   = 0x20,
+  USB_REQ_ATECC_CERT   = 0x21,
 };
 
 enum {
@@ -390,6 +397,7 @@ uint16_t bitstream_idx;
 
 void handle_pending_usb_setup() {
   __xdata struct usb_req_setup *req = (__xdata struct usb_req_setup *)SETUPDAT;
+  __xdata uint8_t cert[32] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31};
 
   // EEPROM read/write requests
   if(req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_OUT) &&
@@ -739,6 +747,48 @@ void handle_pending_usb_setup() {
     return;
   }
 
+  // ATECC requests
+  if(((req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN) &&
+      req->wLength == 64) ||
+      (req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_OUT) &&
+      req->wLength == 32)) &&
+     req->bRequest == USB_REQ_ATECC_SIGN) {
+    bool     arg_get = (req->bmRequestType & USB_DIR_IN);
+    pending_setup = false;
+
+    atecc_wake();
+    delay_us(1500);
+    if(arg_get) {
+      while(EP0CS & _BUSY);
+      if(!atecc_sign(&atecc_packet, 0, EP0BUF)){
+        STALL_EP0();
+      } else {
+        xmemcpy(EP0BUF, &atecc_packet.data, 64);
+        //xmemcpy(EP0BUF, cert, 32);
+        SETUP_EP0_BUF(64);
+      }
+    } else {
+      SETUP_EP0_BUF(32);
+      while(EP0CS & _BUSY);
+      if(!atecc_nonce(&atecc_packet, EP0BUF)) {
+        STALL_EP0();
+      }
+    }
+    return;
+  }
+
+  if((req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN)) &&
+     req->bRequest == USB_REQ_ATECC_CERT &&
+     req->wLength == 32) {
+    pending_setup = false;
+
+    while(EP0CS & _BUSY);
+    xmemcpy(EP0BUF, cert, 32);
+    SETUP_EP0_BUF(32);
+
+    return;
+  }
+
   // Microsoft descriptor requests
   if(req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN) &&
      req->bRequest == USB_REQ_GET_MS_DESCRIPTOR) {
@@ -815,6 +865,7 @@ int main() {
   iobuf_init_dac_ldo();
   iobuf_init_adc();
   fifo_init();
+  atecc_init(&atecc_packet);
 
   // Disable EP1IN/OUT
   SYNCDELAY;

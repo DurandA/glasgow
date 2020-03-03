@@ -49,6 +49,7 @@ enum {
   I2C_ADDR_IOB_ADC  = 0b1010101,
   I2C_ADDR_IOA_PULL = 0b0100000,
   I2C_ADDR_IOB_PULL = 0b0100001,
+  I2C_ADDR_ATECC    = 0b1100000,
 };
 
 enum {
@@ -116,5 +117,31 @@ bool iobuf_get_pull(uint8_t selector, __xdata uint8_t *enable, __xdata uint8_t *
 void fifo_init();
 void fifo_configure(bool two_ep);
 void fifo_reset(bool two_ep, uint8_t interfaces);
+
+// ATECC API
+#define NONCE_MODE_PASSTHROUGH          ((uint8_t)0x03)
+#define NONCE_MODE_INPUT_LEN_32         ((uint8_t)0x00)
+#define SIGN_MODE_SOURCE_TEMPKEY    ((uint8_t)0x00)
+#define SIGN_MODE_EXTERNAL          ((uint8_t)0x80)
+#define NONCE_MODE_TARGET_TEMPKEY       ((uint8_t)0x00)
+
+#define ATECC_BUFSIZE  67
+
+struct atecc_packet {
+  uint8_t w_addr;
+  uint8_t txsize;
+  uint8_t opcode;
+  uint8_t p1;
+  uint16_t p2;
+  uint8_t data[ATECC_BUFSIZE];
+};
+
+typedef __xdata struct atecc_packet
+  atecc_packet_t;
+
+void atecc_init(atecc_packet_t *packet);
+bool atecc_wake();
+bool atecc_nonce(atecc_packet_t *packet, __xdata const uint8_t *nonce);
+bool atecc_sign(atecc_packet_t *packet, uint16_t key_id, __xdata uint8_t *signature);
 
 #endif
