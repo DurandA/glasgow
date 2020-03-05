@@ -134,6 +134,7 @@ union atecc_packet {
     uint16_t p2;
     uint8_t data[ATECC_BUFSIZE];
   } command;
+  uint8_t status;
   uint8_t data[ATECC_BUFSIZE];
 };
 
@@ -146,9 +147,9 @@ struct atecc_io {
 typedef __xdata struct atecc_io
   atecc_io_t;
 
-void atecc_init(atecc_io_t *packet);
+void atecc_init(atecc_io_t *io_buf);
 bool atecc_wake();
-bool atecc_nonce(atecc_io_t *packet, __xdata const uint8_t *nonce);
-bool atecc_sign(atecc_io_t *packet, uint16_t key_id, __xdata uint8_t *signature);
+bool atecc_nonce(atecc_io_t *io_buf, __xdata const uint8_t *nonce);
+bool atecc_sign(atecc_io_t *io_buf, uint16_t key_id, __xdata uint8_t *signature);
 
 #endif
