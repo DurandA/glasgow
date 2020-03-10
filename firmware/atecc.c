@@ -10,9 +10,9 @@ enum {
   ATECC_OP_GENKEY = 0x40,
 };
 
-void crc16(const uint8_t *data, uint8_t len, uint8_t *crc)
+uint16_t crc16(const uint8_t *data, uint8_t len)
 {
-  uint16_t crc_register = 0;
+  uint16_t crc = 0;
   uint16_t polynom = 0x8005;
   uint8_t shift_register;
   uint8_t data_bit, crc_bit;
@@ -23,16 +23,15 @@ void crc16(const uint8_t *data, uint8_t len, uint8_t *crc)
     for (shift_register = 0x01; shift_register > 0x00; shift_register <<= 1)
     {
       data_bit = (data[i] & shift_register) ? 1 : 0;
-      crc_bit = crc_register >> 15;
-      crc_register <<= 1;
+      crc_bit = crc >> 15;
+      crc <<= 1;
       if (data_bit != crc_bit)
       {
-        crc_register ^= polynom;
+        crc ^= polynom;
       }
     }
   }
-  crc[0] = (uint8_t)(crc_register & 0x00FF);
-  crc[1] = (uint8_t)(crc_register >> 8);
+  return crc;
 }
 
 bool atecc_idle() {
@@ -78,7 +77,8 @@ bool atecc_wake() {
 bool atecc_send(atecc_io_t *io_buf)
 {
   uint8_t* crc_dat = ((uint8_t *)io_buf)+1;
-  crc16(crc_dat, io_buf->len-2, crc_dat+io_buf->len-2);
+  uint16_t* crc = (uint16_t*)(crc_dat+io_buf->len-2);
+  *crc = crc16(crc_dat, io_buf->len-2);
   if(!i2c_start(I2C_ADDR_ATECC<<1))
 		goto fail;
   if(!i2c_write((uint8_t*)io_buf, io_buf->len+1))
