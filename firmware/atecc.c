@@ -10,7 +10,7 @@ enum {
   ATECC_OP_GENKEY = 0x40,
 };
 
-uint16_t crc16(const uint8_t *data, uint8_t len)
+uint16_t crc16(__xdata const uint8_t *data, uint8_t len)
 {
   uint16_t crc = 0;
   uint16_t polynom = 0x8005;
@@ -76,12 +76,12 @@ bool atecc_wake() {
 
 bool atecc_send(atecc_io_t *io_buf)
 {
-  uint8_t* crc_dat = ((uint8_t *)io_buf)+1;
-  uint16_t* crc = (uint16_t*)(crc_dat+io_buf->len-2);
+  __xdata uint8_t* crc_dat = ((__xdata uint8_t *)io_buf)+1;
+  __xdata uint16_t* crc = (uint16_t*)(crc_dat+io_buf->len-2);
   *crc = crc16(crc_dat, io_buf->len-2);
   if(!i2c_start(I2C_ADDR_ATECC<<1))
 		goto fail;
-  if(!i2c_write((uint8_t*)io_buf, io_buf->len+1))
+  if(!i2c_write((__xdata uint8_t*)io_buf, io_buf->len+1))
 		goto fail;
   if(!i2c_stop())
     return false;
@@ -94,7 +94,7 @@ fail:
 bool atecc_recv(atecc_io_t *io_buf, uint8_t len) {
   if(!i2c_start((I2C_ADDR_ATECC<<1)|1))
 		goto fail;
-	if(!i2c_read(((uint8_t*)io_buf)+1/*TODO start from io_buf.len*/, len))
+	if(!i2c_read(((__xdata uint8_t*)io_buf)+1/*TODO start from io_buf.len*/, len))
 		goto fail;
   // TODO: check CRC 
   return true;
