@@ -35,7 +35,7 @@ uint16_t crc16(__xdata const uint8_t *data, uint8_t len)
 }
 
 bool atecc_idle() {
-  i2c_start(I2C_ADDR_ATECC<<1);
+  i2c_start((uint8_t)I2C_ADDR_ATECC<<1);
   if(!i2c_write("\x02", 1))
     goto fail;
   if(!i2c_stop())
@@ -48,7 +48,7 @@ fail:
 }
 
 bool atecc_sleep() {
-  i2c_start(I2C_ADDR_ATECC<<1);
+  i2c_start((uint8_t)I2C_ADDR_ATECC<<1);
   if(!i2c_write("\x01", 1))
     goto fail;
   if(!i2c_stop())
