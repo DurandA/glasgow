@@ -127,7 +127,7 @@ void fifo_reset(bool two_ep, uint8_t interfaces);
 
 #define ATECC_BUFSIZE  (64+2)
 
-union atecc_packet {
+typedef union {
   struct {
     uint8_t opcode;
     uint8_t p1;
@@ -136,12 +136,12 @@ union atecc_packet {
   } command;
   uint8_t status;
   uint8_t data[ATECC_BUFSIZE];
-};
+} atecc_packet_t;
 
 struct atecc_io {
   uint8_t w_addr;
   uint8_t len;
-  union atecc_packet;
+  atecc_packet_t;
 };
 
 typedef __xdata struct atecc_io
