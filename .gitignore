@@ -1,12 +1,12 @@
 __pycache__/
 *.egg-info/
 *.eggs/
+dist/
 build/
 *.pyc
 *.v
 *.vcd
 *.gtkw
-*.ihex
 *.log
 *.*b[ac]k
 _autosave-*

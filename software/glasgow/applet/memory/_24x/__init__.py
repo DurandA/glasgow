@@ -127,8 +127,11 @@ class Memory24xApplet(I2CInitiatorApplet, name="memory-24x"):
     def add_run_arguments(cls, parser, access):
         super().add_run_arguments(parser, access)
 
+        def address(arg):
+            return int(arg, 0)
+
         parser.add_argument(
-            "-A", "--i2c-address", type=int, metavar="I2C-ADDR", default=0b1010000,
+            "-A", "--i2c-address", type=address, metavar="I2C-ADDR", default=0b1010000,
             help="I²C address of the memory; typically 0b1010(A2)(A1)(A0) "
                  "(default: 0b1010000)")
         parser.add_argument(
@@ -152,8 +155,7 @@ class Memory24xApplet(I2CInitiatorApplet, name="memory-24x"):
         def hex_bytes(arg):
             return bytes.fromhex(arg)
 
-        # TODO(py3.7): add required=True
-        p_operation = parser.add_subparsers(dest="operation", metavar="OPERATION")
+        p_operation = parser.add_subparsers(dest="operation", metavar="OPERATION", required=True)
 
         p_read = p_operation.add_parser(
             "read", help="read memory")
@@ -172,13 +174,26 @@ class Memory24xApplet(I2CInitiatorApplet, name="memory-24x"):
         p_write.add_argument(
             "address", metavar="ADDRESS", type=address,
             help="write memory starting at address ADDRESS")
-        g_data = p_write.add_mutually_exclusive_group(required=True)
-        g_data.add_argument(
+        g_write_data = p_write.add_mutually_exclusive_group(required=True)
+        g_write_data.add_argument(
             "-d", "--data", metavar="DATA", type=hex_bytes,
             help="write memory with DATA as hex bytes")
-        g_data.add_argument(
+        g_write_data.add_argument(
             "-f", "--file", metavar="FILENAME", type=argparse.FileType("rb"),
             help="write memory with contents of FILENAME")
+
+        p_verify = p_operation.add_parser(
+            "verify", help="verify memory")
+        p_verify.add_argument(
+            "address", metavar="ADDRESS", type=address,
+            help="verify memory starting at address ADDRESS")
+        g_verify_data = p_verify.add_mutually_exclusive_group(required=True)
+        g_verify_data.add_argument(
+            "-d", "--data", metavar="DATA", type=hex_bytes,
+            help="compare memory with DATA as hex bytes")
+        g_verify_data.add_argument(
+            "-f", "--file", metavar="FILENAME", type=argparse.FileType("rb"),
+            help="compare memory with contents of FILENAME")
 
     async def interact(self, device, args, m24x_iface):
         if args.operation == "read":
@@ -200,3 +215,17 @@ class Memory24xApplet(I2CInitiatorApplet, name="memory-24x"):
             success = await m24x_iface.write(args.address, data)
             if not success:
                 raise GlasgowAppletError("memory did not acknowledge write")
+
+        if args.operation == "verify":
+            if args.data is not None:
+                golden_data = args.data
+            if args.file is not None:
+                golden_data = args.file.read()
+
+            actual_data = await m24x_iface.read(args.address, len(golden_data))
+            if actual_data is None:
+                raise GlasgowAppletError("memory did not acknowledge read")
+            if actual_data == golden_data:
+                self.logger.info("verify PASS")
+            else:
+                raise GlasgowAppletError("verify FAIL")

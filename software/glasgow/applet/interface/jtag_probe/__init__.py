@@ -22,20 +22,22 @@
 import struct
 import logging
 import asyncio
-from nmigen.compat import *
-from nmigen.compat.genlib.cdc import MultiReg
+import argparse
+from nmigen import *
+from nmigen.lib.cdc import FFSynchronizer
 
 from ....support.bits import *
 from ....support.logging import *
-from ....support.pyrepl import *
+from ....support.arepl import *
 from ....gateware.pads import *
 from ....database.jedec import *
 from ....arch.jtag import *
 from ... import *
 
 
-class JTAGProbeBus(Module):
+class JTAGProbeBus(Elaboratable):
     def __init__(self, pads):
+        self._pads = pads
         self.tck = Signal(reset=1)
         self.tms = Signal(reset=1)
         self.tdo = Signal(reset=1)
@@ -43,9 +45,10 @@ class JTAGProbeBus(Module):
         self.trst_z = Signal(reset=0)
         self.trst_o = Signal(reset=0)
 
-        ###
-
-        self.comb += [
+    def elaborate(self, platform):
+        m = Module()
+        pads = self._pads
+        m.d.comb += [
             pads.tck_t.oe.eq(1),
             pads.tck_t.o.eq(self.tck),
             pads.tms_t.oe.eq(1),
@@ -53,22 +56,26 @@ class JTAGProbeBus(Module):
             pads.tdi_t.oe.eq(1),
             pads.tdi_t.o.eq(self.tdi),
         ]
-        self.specials += [
-            MultiReg(pads.tdo_t.i, self.tdo),
+        m.submodules += [
+            FFSynchronizer(pads.tdo_t.i, self.tdo),
         ]
         if hasattr(pads, "trst_t"):
-            self.sync += [
+            m.d.sync += [
                 pads.trst_t.oe.eq(~self.trst_z),
                 pads.trst_t.o.eq(~self.trst_o)
             ]
+        return m
 
 
 BIT_AUX_TRST_Z  = 0b01
 BIT_AUX_TRST_O  = 0b10
 
 
-class JTAGProbeAdapter(Module):
+class JTAGProbeAdapter(Elaboratable):
     def __init__(self, bus, period_cyc):
+        self.bus = bus
+        self._period_cyc = period_cyc
+
         self.stb = Signal()
         self.rdy = Signal()
 
@@ -78,37 +85,37 @@ class JTAGProbeAdapter(Module):
         self.aux_i = C(0)
         self.aux_o = Cat(bus.trst_z, bus.trst_o)
 
-        ###
+    def elaborate(self, platform):
+        m = Module()
+        half_cyc = int(self._period_cyc // 2)
+        timer    = Signal(range(half_cyc+1))
 
-        half_cyc = int(period_cyc // 2)
-        timer    = Signal(max=half_cyc)
-
-        self.submodules.fsm = FSM()
-        self.fsm.act("TCK-H",
-            bus.tck.eq(1),
-            If(timer != 0,
-                NextValue(timer, timer - 1)
-            ).Else(
-                If(self.stb,
-                    NextValue(timer, half_cyc - 1),
-                    NextValue(bus.tms, self.tms),
-                    NextValue(bus.tdi, self.tdi),
-                    NextState("TCK-L")
-                ).Else(
-                    self.rdy.eq(1)
-                )
-            )
-        )
-        self.fsm.act("TCK-L",
-            bus.tck.eq(0),
-            If(timer != 0,
-                NextValue(timer, timer - 1)
-            ).Else(
-                NextValue(timer, half_cyc - 1),
-                NextValue(self.tdo, bus.tdo),
-                NextState("TCK-H")
-            )
-        )
+        with m.FSM() as fsm:
+            with m.State("TCK-H"):
+                m.d.comb += self.bus.tck.eq(1)
+                with m.If(timer != 0):
+                    m.d.sync += timer.eq(timer - 1)
+                with m.Else():
+                    with m.If(self.stb):
+                        m.d.sync += [
+                            timer   .eq(half_cyc - 1),
+                            self.bus.tms .eq(self.tms),
+                            self.bus.tdi .eq(self.tdi),
+                        ]
+                        m.next = "TCK-L"
+                    with m.Else():
+                        m.d.comb += self.rdy.eq(1)
+            with m.State("TCK-L"):
+                m.d.comb += self.bus.tck.eq(0)
+                with m.If(timer != 0):
+                    m.d.sync += timer.eq(timer - 1)
+                with m.Else():
+                    m.d.sync += [
+                        timer   .eq(half_cyc - 1),
+                        self.tdo.eq(self.bus.tdo),
+                    ]
+                    m.next = "TCK-H"
+        return m
 
 
 CMD_MASK       = 0b11110000
@@ -124,8 +131,14 @@ BIT_LAST       =     0b0100
 BIT_TDI        =     0b1000
 
 
-class JTAGProbeDriver(Module):
+class JTAGProbeDriver(Elaboratable):
     def __init__(self, adapter, out_fifo, in_fifo):
+        self.adapter = adapter
+        self._out_fifo = out_fifo
+        self._in_fifo = in_fifo
+
+    def elaborate(self, platform):
+        m = Module()
         cmd     = Signal(8)
         count   = Signal(16)
         bitno   = Signal(3)
@@ -133,125 +146,123 @@ class JTAGProbeDriver(Module):
         shreg_o = Signal(8)
         shreg_i = Signal(8)
 
-        self.submodules.fsm = FSM()
-        self.fsm.act("RECV-COMMAND",
-            in_fifo.flush.eq(1),
-            If(out_fifo.readable,
-                out_fifo.re.eq(1),
-                NextValue(cmd, out_fifo.dout),
-                NextState("COMMAND")
-            )
-        )
-        self.fsm.act("COMMAND",
-            If(((cmd & CMD_MASK) == CMD_SHIFT_TMS) |
-                   ((cmd & CMD_MASK) == CMD_SHIFT_TDIO),
-                NextState("RECV-COUNT-1")
-            ).Elif((cmd & CMD_MASK) == CMD_GET_AUX,
-                NextState("SEND-AUX")
-            ).Elif((cmd & CMD_MASK) == CMD_SET_AUX,
-                NextState("RECV-AUX")
-            )
-        )
-        self.fsm.act("SEND-AUX",
-            If(in_fifo.writable,
-                in_fifo.we.eq(1),
-                in_fifo.din.eq(adapter.aux_i),
-                NextState("RECV-COMMAND")
-            )
-        )
-        self.fsm.act("RECV-AUX",
-            If(out_fifo.readable,
-                out_fifo.re.eq(1),
-                NextValue(adapter.aux_o, out_fifo.dout),
-                NextState("RECV-COMMAND")
-            )
-        )
-        self.fsm.act("RECV-COUNT-1",
-            If(out_fifo.readable,
-                out_fifo.re.eq(1),
-                NextValue(count[0:8], out_fifo.dout),
-                NextState("RECV-COUNT-2")
-            )
-        )
-        self.fsm.act("RECV-COUNT-2",
-            If(out_fifo.readable,
-                out_fifo.re.eq(1),
-                NextValue(count[8:16], out_fifo.dout),
-                NextState("RECV-BITS")
-            )
-        )
-        self.fsm.act("RECV-BITS",
-            If(count == 0,
-                NextState("RECV-COMMAND")
-            ).Else(
-                If(count > 8,
-                    NextValue(bitno, 0)
-                ).Else(
-                    NextValue(align, 8 - count[:3]),
-                    NextValue(bitno, 8 - count[:3])
-                ),
-                If(cmd & BIT_DATA_OUT,
-                    If(out_fifo.readable,
-                        out_fifo.re.eq(1),
-                        NextValue(shreg_o, out_fifo.dout),
-                        NextState("SHIFT-SETUP")
-                    )
-                ).Else(
-                    NextValue(shreg_o, 0b11111111),
-                    NextState("SHIFT-SETUP")
-                )
-            )
-        )
-        self.fsm.act("SHIFT-SETUP",
-            NextValue(adapter.stb, 1),
-            If((cmd & CMD_MASK) == CMD_SHIFT_TMS,
-                NextValue(adapter.tms, shreg_o[0]),
-                NextValue(adapter.tdi, (cmd & BIT_TDI) != 0),
-            ).Else(
-                NextValue(adapter.tms, 0),
-                If(cmd & BIT_LAST,
-                    NextValue(adapter.tms, count == 1)
-                ),
-                NextValue(adapter.tdi, shreg_o[0]),
-            ),
-            NextValue(shreg_o, Cat(shreg_o[1:], 1)),
-            NextValue(count, count - 1),
-            NextValue(bitno, bitno + 1),
-            NextState("SHIFT-CAPTURE")
-        )
-        self.fsm.act("SHIFT-CAPTURE",
-            NextValue(adapter.stb, 0),
-            If(adapter.rdy,
-                NextValue(shreg_i, Cat(shreg_i[1:], adapter.tdo)),
-                If(bitno == 0,
-                    NextState("SEND-BITS")
-                ).Else(
-                    NextState("SHIFT-SETUP")
-                )
-            )
-        )
-        self.fsm.act("SEND-BITS",
-            If(cmd & BIT_DATA_IN,
-                If(in_fifo.writable,
-                    in_fifo.we.eq(1),
-                    If(count == 0,
-                        in_fifo.din.eq(shreg_i >> align)
-                    ).Else(
-                        in_fifo.din.eq(shreg_i)
-                    ),
-                    NextState("RECV-BITS")
-                )
-            ).Else(
-                NextState("RECV-BITS")
-            )
-        )
+        with m.FSM() as fsm:
+            with m.State("RECV-COMMAND"):
+                m.d.comb += self._in_fifo.flush.eq(1)
+                with m.If(self._out_fifo.readable):
+                    m.d.comb += self._out_fifo.re.eq(1)
+                    m.d.sync += cmd.eq(self._out_fifo.dout)
+                    m.next = "COMMAND"
+
+            with m.State("COMMAND"):
+                with m.If(((cmd & CMD_MASK) == CMD_SHIFT_TMS) |
+                    ((cmd & CMD_MASK) == CMD_SHIFT_TDIO)):
+                    m.next = "RECV-COUNT-1"
+                with m.Elif((cmd & CMD_MASK) == CMD_GET_AUX):
+                    m.next = "SEND-AUX"
+                with m.Elif((cmd & CMD_MASK) == CMD_SET_AUX):
+                    m.next = "RECV-AUX"
+
+            with m.State("SEND-AUX"):
+                with m.If(self._in_fifo.writable):
+                    m.d.comb += [
+                        self._in_fifo.we.eq(1),
+                        self._in_fifo.din.eq(self.adapter.aux_i),
+                    ]
+                    m.next = "RECV-COMMAND"
+
+            with m.State("RECV-AUX"):
+                with m.If(self._out_fifo.readable):
+                    m.d.comb += self._out_fifo.re.eq(1)
+                    m.d.sync += self.adapter.aux_o.eq(self._out_fifo.dout)
+                    m.next = "RECV-COMMAND"
+
+            with m.State("RECV-COUNT-1"):
+                with m.If(self._out_fifo.readable):
+                    m.d.comb += self._out_fifo.re.eq(1)
+                    m.d.sync += count[0:8].eq(self._out_fifo.dout)
+                    m.next = "RECV-COUNT-2"
+
+            with m.State("RECV-COUNT-2"):
+                with m.If(self._out_fifo.readable):
+                    m.d.comb += self._out_fifo.re.eq(1),
+                    m.d.sync += count[8:16].eq(self._out_fifo.dout)
+                    m.next = "RECV-BITS"
+
+            with m.State("RECV-BITS"):
+                with m.If(count == 0):
+                    m.next = "RECV-COMMAND"
+                with m.Else():
+                    with m.If(count > 8):
+                        m.d.sync += bitno.eq(0)
+                    with m.Else():
+                        m.d.sync += [
+                            align.eq(8 - count[:3]),
+                            bitno.eq(8 - count[:3]),
+                        ]
+                    with m.If(cmd & BIT_DATA_OUT):
+                        with m.If(self._out_fifo.readable):
+                            m.d.comb += self._out_fifo.re.eq(1)
+                            m.d.sync += shreg_o.eq(self._out_fifo.dout)
+                            m.next = "SHIFT-SETUP"
+                    with m.Else():
+                        m.d.sync += shreg_o.eq(0b11111111)
+                        m.next = "SHIFT-SETUP"
+
+            with m.State("SHIFT-SETUP"):
+                m.d.sync += self.adapter.stb.eq(1)
+                with m.If((cmd & CMD_MASK) == CMD_SHIFT_TMS):
+                    m.d.sync += self.adapter.tms.eq(shreg_o[0])
+                    m.d.sync += self.adapter.tdi.eq((cmd & BIT_TDI) != 0)
+                with m.Else():
+                    m.d.sync += self.adapter.tms.eq(0)
+                    with m.If(cmd & BIT_LAST):
+                        m.d.sync += self.adapter.tms.eq(count == 1)
+                    m.d.sync += self.adapter.tdi.eq(shreg_o[0])
+                m.d.sync += [
+                    shreg_o.eq(Cat(shreg_o[1:], 1)),
+                    count.eq(count - 1),
+                    bitno.eq(bitno + 1),
+                ]
+                m.next = "SHIFT-CAPTURE"
+
+            with m.State("SHIFT-CAPTURE"):
+                m.d.sync += self.adapter.stb.eq(0)
+                with m.If(self.adapter.rdy):
+                    m.d.sync += shreg_i.eq(Cat(shreg_i[1:], self.adapter.tdo))
+                    with m.If(bitno == 0):
+                        m.next = "SEND-BITS"
+                    with m.Else():
+                        m.next = "SHIFT-SETUP"
+
+            with m.State("SEND-BITS"):
+                with m.If(cmd & BIT_DATA_IN):
+                    with m.If(self._in_fifo.writable):
+                        m.d.comb += self._in_fifo.we.eq(1),
+                        with m.If(count == 0):
+                            m.d.comb += self._in_fifo.din.eq(shreg_i >> align)
+                        with m.Else():
+                            m.d.comb += self._in_fifo.din.eq(shreg_i)
+                        m.next = "RECV-BITS"
+                with m.Else():
+                    m.next = "RECV-BITS"
+
+        return m
 
 
-class JTAGProbeSubtarget(Module):
+class JTAGProbeSubtarget(Elaboratable):
     def __init__(self, pads, out_fifo, in_fifo, period_cyc):
-        self.submodules.bus     = JTAGProbeBus(pads)
-        self.submodules.adapter = JTAGProbeAdapter(self.bus, period_cyc)
-        self.submodules.driver  = JTAGProbeDriver(self.adapter, out_fifo, in_fifo)
+        self._pads       = pads
+        self._out_fifo   = out_fifo
+        self._in_fifo    = in_fifo
+        self._period_cyc = period_cyc
+
+    def elaborate(self, platform):
+        m = Module()
+        m.submodules.bus     = JTAGProbeBus(self._pads)
+        m.submodules.adapter = JTAGProbeAdapter(m.submodules.bus, self._period_cyc)
+        m.submodules.driver  = JTAGProbeDriver(m.submodules.adapter, self._out_fifo, self._in_fifo)
+        return m
 
 
 class JTAGProbeError(GlasgowAppletError):
@@ -266,6 +277,9 @@ class JTAGProbeStateTransitionError(JTAGProbeError):
 
 
 class JTAGProbeInterface:
+    scan_ir_max_length = 128
+    scan_dr_max_length = 1024
+
     def __init__(self, interface, logger, has_trst=False, __name__=__name__):
         self.lower   = interface
         self._logger = logger
@@ -327,6 +341,7 @@ class JTAGProbeInterface:
 
     @staticmethod
     def _chunk_count(count, last, chunk_size=0xffff):
+        assert count >= 0
         while count > chunk_size:
             yield chunk_size, False
             count -= chunk_size
@@ -340,55 +355,58 @@ class JTAGProbeInterface:
             offset += chunk_size
         yield bits[offset:], last
 
-    async def shift_tdio(self, tdi_bits, last=True):
+    async def _shift_dummy(self, count, last=False):
+        for count, chunk_last in self._chunk_count(count, last):
+            await self.lower.write(struct.pack("<BH",
+                CMD_SHIFT_TDIO|(BIT_LAST if chunk_last else 0), count))
+
+    async def shift_tdio(self, tdi_bits, *, prefix=0, suffix=0, last=True):
         assert self._state in ("Shift-IR", "Shift-DR")
         tdi_bits = bits(tdi_bits)
         tdo_bits = bits()
-        self._log_l("shift tdio-i=<%s>", dump_bin(tdi_bits))
-        for tdi_bits, last in self._chunk_bits(tdi_bits, last):
+        self._log_l("shift tdio-i=%d,<%s>,%d", prefix, dump_bin(tdi_bits), suffix)
+        await self._shift_dummy(prefix)
+        for tdi_bits, chunk_last in self._chunk_bits(tdi_bits, last and suffix == 0):
             await self.lower.write(struct.pack("<BH",
-                CMD_SHIFT_TDIO|BIT_DATA_IN|BIT_DATA_OUT|(BIT_LAST if last else 0),
+                CMD_SHIFT_TDIO|BIT_DATA_IN|BIT_DATA_OUT|(BIT_LAST if chunk_last else 0),
                 len(tdi_bits)))
             tdi_bytes = bytes(tdi_bits)
             await self.lower.write(tdi_bytes)
             tdo_bytes = await self.lower.read(len(tdi_bytes))
             tdo_bits += bits(tdo_bytes, len(tdi_bits))
-        self._log_l("shift tdio-o=<%s>", dump_bin(tdo_bits))
+        await self._shift_dummy(suffix, last)
+        self._log_l("shift tdio-o=%d,<%s>,%d", prefix, dump_bin(tdo_bits), suffix)
         self._shift_last(last)
         return tdo_bits
 
-    async def shift_tdi(self, tdi_bits, last=True):
+    async def shift_tdi(self, tdi_bits, *, prefix=0, suffix=0, last=True):
         assert self._state in ("Shift-IR", "Shift-DR")
         tdi_bits = bits(tdi_bits)
-        self._log_l("shift tdi=<%s>", dump_bin(tdi_bits))
-        for tdi_bits, last in self._chunk_bits(tdi_bits, last):
+        self._log_l("shift tdi=%d,<%s>,%d", prefix, dump_bin(tdi_bits), suffix)
+        await self._shift_dummy(prefix)
+        for tdi_bits, chunk_last in self._chunk_bits(tdi_bits, last and suffix == 0):
             await self.lower.write(struct.pack("<BH",
-                CMD_SHIFT_TDIO|BIT_DATA_OUT|(BIT_LAST if last else 0),
+                CMD_SHIFT_TDIO|BIT_DATA_OUT|(BIT_LAST if chunk_last else 0),
                 len(tdi_bits)))
             tdi_bytes = bytes(tdi_bits)
             await self.lower.write(tdi_bytes)
+        await self._shift_dummy(suffix, last)
         self._shift_last(last)
 
-    async def shift_tdo(self, count, last=True):
+    async def shift_tdo(self, count, *, prefix=0, suffix=0, last=True):
         assert self._state in ("Shift-IR", "Shift-DR")
         tdo_bits = bits()
-        for count, last in self._chunk_count(count, last):
+        await self._shift_dummy(prefix)
+        for count, chunk_last in self._chunk_count(count, last and suffix == 0):
             await self.lower.write(struct.pack("<BH",
-                CMD_SHIFT_TDIO|BIT_DATA_IN|(BIT_LAST if last else 0),
+                CMD_SHIFT_TDIO|BIT_DATA_IN|(BIT_LAST if chunk_last else 0),
                 count))
             tdo_bytes = await self.lower.read((count + 7) // 8)
             tdo_bits += bits(tdo_bytes, count)
-        self._log_l("shift tdo=<%s>", dump_bin(tdo_bits))
+        await self._shift_dummy(suffix, last)
+        self._log_l("shift tdo=%d,<%s>,%d", prefix, dump_bin(tdo_bits), suffix)
         self._shift_last(last)
         return tdo_bits
-
-    async def shift_dummy(self, count, last=True):
-        assert self._state in ("Shift-IR", "Shift-DR")
-        self._log_l("shift dummy count=%d", count)
-        for count, last in self._chunk_count(count, last):
-            await self.lower.write(struct.pack("<BH",
-                CMD_SHIFT_TDIO|(BIT_LAST if last else 0), count))
-        self._shift_last(last)
 
     async def pulse_tck(self, count):
         assert self._state in ("Run-Test/Idle", "Pause-IR", "Pause-DR")
@@ -528,205 +546,278 @@ class JTAGProbeInterface:
         await self.enter_run_test_idle()
         await self.pulse_tck(count)
 
-    async def exchange_ir(self, data):
-        self._current_ir = data = bits(data)
-        self._log_h("exchange ir")
+    async def exchange_ir(self, data, *, prefix=0, suffix=0):
+        data = bits(data)
+        self._current_ir = (prefix, data, suffix)
+        self._log_h("exchange ir-i=%d,<%s>,%d", prefix, dump_bin(data), suffix)
         await self.enter_shift_ir()
-        data = await self.shift_tdio(data)
+        data = await self.shift_tdio(data, prefix=prefix, suffix=suffix)
         await self.enter_update_ir()
+        self._log_h("exchange ir-o=%d,<%s>,%d", prefix, dump_bin(data), suffix)
         return data
 
-    async def read_ir(self, count):
-        self._current_ir = bits((1,)) * count
+    async def read_ir(self, count, *, prefix=0, suffix=0):
+        self._current_ir = (prefix, bits((1,)) * count, suffix)
         await self.enter_shift_ir()
-        data = await self.shift_tdo(count)
+        data = await self.shift_tdo(count, prefix=prefix, suffix=suffix)
         await self.enter_update_ir()
-        self._log_h("read ir=<%s>", dump_bin(data))
+        self._log_h("read ir=%d,<%s>,%d", prefix, dump_bin(data), suffix)
         return data
 
-    async def write_ir(self, data, *, elide=True):
-        if data == self._current_ir and elide:
+    async def write_ir(self, data, *, prefix=0, suffix=0, elide=True):
+        data = bits(data)
+        if (prefix, data, suffix) == self._current_ir and elide:
             self._log_h("write ir (elided)")
             return
-        self._current_ir = data = bits(data)
-        self._log_h("write ir=<%s>", dump_bin(data))
+        self._current_ir = (prefix, data, suffix)
+        self._log_h("write ir=%d,<%s>,%d", prefix, dump_bin(data), suffix)
         await self.enter_shift_ir()
-        await self.shift_tdi(data)
+        await self.shift_tdi(data, prefix=prefix, suffix=suffix)
         await self.enter_update_ir()
 
-    async def exchange_dr(self, data):
-        self._log_h("exchange dr")
+    async def exchange_dr(self, data, *, prefix=0, suffix=0):
+        self._log_h("exchange dr-i=%d,<%s>,%d", prefix, dump_bin(data), suffix)
         await self.enter_shift_dr()
-        data = await self.shift_tdio(data)
+        data = await self.shift_tdio(data, prefix=prefix, suffix=suffix)
         await self.enter_update_dr()
+        self._log_h("exchange dr-o=%d,<%s>,%d", prefix, dump_bin(data), suffix)
         return data
 
-    async def read_dr(self, count, idempotent=False):
+    async def read_dr(self, count, *, prefix=0, suffix=0):
         await self.enter_shift_dr()
-        data = await self.shift_tdo(count, last=not idempotent)
-        if idempotent:
-            # Shift what we just read back in. This is useful to avoid disturbing any bits
-            # in R/W DRs when we go through Update-DR.
-            await self.shift_tdi(data)
+        data = await self.shift_tdo(count, prefix=prefix, suffix=suffix)
         await self.enter_update_dr()
-        if idempotent:
-            self._log_h("read idempotent dr=<%s>", dump_bin(data))
-        else:
-            self._log_h("read dr=<%s>", dump_bin(data))
+        self._log_h("read dr=%d,<%s>,%d", prefix, dump_bin(data), suffix)
         return data
 
-    async def write_dr(self, data):
+    async def write_dr(self, data, *, prefix=0, suffix=0):
         data = bits(data)
-        self._log_h("write dr=<%s>", dump_bin(data))
+        self._log_h("write dr=%d,<%s>,%d", prefix, dump_bin(data), suffix)
         await self.enter_shift_dr()
-        await self.shift_tdi(data)
+        await self.shift_tdi(data, prefix=prefix, suffix=suffix)
         await self.enter_update_dr()
 
-    # Specialized operations
+    # Shift chain introspection
 
-    async def _scan_xr(self, xr, max_length, zero_ok=False):
+    async def _scan_xr(self, xr, *, max_length=None, check=True, idempotent=True):
         assert xr in ("ir", "dr")
-        self._log_h("scan %s length", xr)
+        if idempotent:
+            self._log_h("scan %s idempotent", xr)
+        else:
+            self._log_h("scan %s", xr)
 
-        if xr ==  "ir":
+        if max_length is None:
+            if xr == "ir":
+                max_length = self.scan_ir_max_length
+            if xr == "dr":
+                max_length = self.scan_dr_max_length
+
+        if xr == "ir":
             await self.enter_shift_ir()
-        if xr ==  "dr":
+        if xr == "dr":
             await self.enter_shift_dr()
 
+        # Add 1 so that registers of exactly `max_length` could be scanned successfully.
+        data_0 = await self.shift_tdio((0,) * (max_length + 1), last=False)
+        data_1 = await self.shift_tdio((1,) * (max_length + 1), last=not idempotent)
+
         try:
-            data_1 = await self.shift_tdio((1,) * max_length, last=False)
-            data_0 = await self.shift_tdio((0,) * max_length, last=False)
-            for length in range(max_length):
-                if data_0[length] == 0:
-                    self._log_h("scan %s length=%d data=<%s>",
-                                xr, length, dump_bin(data_1[:length]))
-                    return data_1[:length]
+            value = None
+            for length in range(max_length + 1):
+                if data_1[length] == 1:
+                    if data_0[length:].to_int() == 0:
+                        value = data_0[:length]
+                    break
+
+            if value is None:
+                self._log_h("scan %s overlong", xr)
+                if check:
+                    raise JTAGProbeError("{} shift chain is too long".format(xr.upper()))
+            elif len(value) == 0:
+                self._log_h("scan %s empty", xr)
+                if check:
+                    raise JTAGProbeError("{} shift chain is empty".format(xr.upper()))
             else:
-                self._log_h("overlong %s", xr)
-                return
+                self._log_h("scan %s length=%d data=<%s>",
+                            xr, length, dump_bin(data_0[:length]))
+            return value
 
         finally:
-            if xr == "ir":
-                # Fill the register with BYPASS instructions.
-                await self.shift_tdi((1,) * length, last=True)
-            if xr == "dr":
-                # Restore the old contents, just in case this matters.
-                await self.shift_tdi(data_1[:length], last=True)
+            if idempotent:
+                if value is None or length == 0:
+                    # Idempotent scan requested, but isn't possible: finish shifting.
+                    await self.shift_tdi((1,), last=True)
+                else:
+                    # Idempotent scan is possible: shift scanned data back.
+                    await self.shift_tdi(value, last=True)
 
             await self.enter_run_test_idle()
 
-    async def scan_ir(self, max_length):
-        return await self._scan_xr("ir", max_length)
+    async def scan_ir(self, *, max_length=None, check=True):
+        return await self._scan_xr("ir", max_length=max_length, check=check, idempotent=False)
 
-    async def scan_dr(self, max_length):
-        return await self._scan_xr("dr", max_length)
+    async def scan_dr(self, *, max_length=None, check=True):
+        return await self._scan_xr("dr", max_length=max_length, check=check, idempotent=True)
 
-    async def scan_ir_length(self, max_length):
-        data = await self.scan_ir(max_length)
-        if data is None: return
-        return len(data)
+    async def scan_ir_length(self, *, max_length=None):
+        return len(await self.scan_ir(max_length=max_length))
 
-    async def scan_dr_length(self, max_length, zero_ok=False):
-        data = await self.scan_dr(max_length)
-        if data is None: return
-        length = len(data)
-        assert zero_ok or length > 0
-        return length
+    async def scan_dr_length(self, *, max_length=None):
+        return len(await self.scan_dr(max_length=max_length))
 
-    def segment_idcodes(self, dr_value):
+    async def scan_reset_dr_ir(self):
+        """Capture IR values and IDCODE/BYPASS DR values using Test-Logic-Reset."""
+
+        await self.test_reset()
+        # Scan DR chain first, since scanning IR chain will latch BYPASS into every IR.
+        dr_value = await self._scan_xr("dr", idempotent=False)
+        ir_value = await self._scan_xr("ir", idempotent=False)
+        return (dr_value, ir_value)
+
+    # Blind interrogation
+
+    def interrogate_dr(self, dr_value, *, check=True):
+        """Split DR value captured after TAP reset into IDCODE/BYPASS chunks."""
+
         idcodes = []
-        index = 0
-        while index < len(dr_value):
-            if dr_value[index]:
-                if len(dr_value) - index >= 32:
-                    idcode = int(dr_value[index:index + 32])
-                    self._log_h("found idcode=<%08x>", idcode)
+        offset = 0
+        while offset < len(dr_value):
+            if dr_value[offset]:
+                if len(dr_value) - offset >= 32:
+                    dr_chunk = dr_value[offset:offset + 32]
+                    idcode = int(dr_chunk)
+                    if dr_chunk[1:12] == bits("00001111111"):
+                        self._log_h("invalid dr idcode=%08x", idcode)
+                        if check:
+                            raise JTAGProbeError("TAP #{} has invalid DR IDCODE={:08x}"
+                                                 .format(len(idcodes), idcode))
+                        return
+                    else:
+                        self._log_h("found dr idcode=%08x (tap #%d)", idcode, len(idcodes))
                     idcodes.append(idcode)
-                    index += 32
+                    offset += 32
                 else:
-                    self._log_h("found truncated idcode=<%s>", dump_bin(dr_value[index:]))
+                    self._log_h("truncated dr idcode=<%s>", dump_bin(dr_value[offset:]))
+                    if check:
+                        raise JTAGProbeError("TAP #{} has truncated DR IDCODE=<{}>"
+                                             .format(len(idcodes), dump_bin(dr_value[offset:])))
                     return
             else:
-                self._log_h("found bypass")
+                self._log_h("found dr bypass (tap #%d)", len(idcodes))
                 idcodes.append(None)
-                index += 1
+                offset += 1
 
         return idcodes
 
-    def segment_irs(self, ir_value, count=None):
-        if ir_value[0:2] != (1,0):
-            self._log_h("ir does not start with 10")
+    def interrogate_ir(self, ir_value, tap_count, *, ir_lengths=None, check=True):
+        """Split IR value captured after TAP reset to determine IR boundaries."""
+        assert tap_count > 0
+
+        # Each captured IR value in a chain must start with <10>. However, the rest of captured
+        # IR bits has unspecified value, which may include <10>.
+        ir_starts = []
+        while True:
+            ir_start = ir_value.find((1,0), start=ir_starts[-1] + 1 if ir_starts else 0)
+            if ir_start == -1:
+                break
+            ir_starts.append(ir_start)
+
+        # There must be at least as many captured IRs in the chain as there are IDCODE/BYPASS DRs.
+        if tap_count > len(ir_starts):
+            self._log_h("invalid ir taps=%d starts=%d", tap_count, len(ir_starts))
+            if check:
+                raise JTAGProbeError("IR capture has fewer <10> transitions than TAPs")
             return
 
-        irs = []
-        ir_offset = 0
-        if count == 1:
-            # 1 TAP case; the entire IR belongs to the only TAP we have.
+        # The chain must start with a valid captured IR value.
+        if ir_starts[0] != 0:
+            self._log_h("invalid ir starts[0]=%d", ir_starts[0])
+            if check:
+                raise JTAGProbeError("IR capture does not start with <10> transition")
+            return
+
+        # If IR lengths are specified explicitly, use them but validate first.
+        if ir_lengths is not None:
+            if len(ir_lengths) != tap_count:
+                self._log_h("invalid ir taps=%d user-lengths=%d", tap_count, len(ir_lengths))
+                if check:
+                    raise JTAGProbeError("IR length count differs from TAP count")
+                return
+
+            if sum(ir_lengths) != len(ir_value):
+                self._log_h("invalid ir total-length=%d user-total-length=%d",
+                            sum(ir_lengths), len(ir_value))
+                if check:
+                    raise JTAGProbeError("IR capture length differs from sum of IR lengths")
+                return
+
+            ir_offset = 0
+            for tap_index, ir_length in enumerate(ir_lengths):
+                if (ir_offset + ir_length not in ir_starts and
+                        ir_offset + ir_length != len(ir_value)):
+                    self._log_h("misaligned ir (tap #%d)", tap_index)
+                    if check:
+                        raise JTAGProbeError("IR length for TAP #{:d} misaligns next TAP"
+                                             .format(tap_index))
+                    return
+
+                self._log_h("explicit ir length=%d (tap #%d)", ir_length, tap_index)
+                ir_offset += ir_length
+
+            return list(ir_lengths)
+
+        # If there's only one device in the chain, then the entire captured IR belongs to it.
+        elif tap_count == 1:
             ir_length = len(ir_value)
-            self._log_h("found ir[%d] (1-tap)", ir_length)
-            irs.append((ir_offset, ir_length))
+            self._log_h("found ir length=%d (single tap)", ir_length)
+            return [ir_length]
+
+        # If there are no more captured IRs than devices in the chain, then IR lengths can be
+        # determined unambiguously.
+        elif tap_count == len(ir_starts):
+            ir_layout = []
+            for ir_start0, ir_start1 in zip(ir_starts, ir_starts[1:] + [len(ir_value)]):
+                ir_length = ir_start1 - ir_start0
+                self._log_h("found ir length=%d (tap #%d)", ir_length, len(ir_layout))
+                ir_layout.append(ir_length)
+            return ir_layout
+
+        # Otherwise IR lengths are ambiguous.
         else:
-            # >1 TAP case; there is no way to segment IR without knowledge of specific devices
-            # involved.
-            self._log_h("found more than 1 tap")
+            ir_chunks = []
+            for ir_start0, ir_start1 in zip(ir_starts, ir_starts[1:] + [len(ir_value)]):
+                ir_chunks.append(ir_start1 - ir_start0)
+            self._log_h("ambiguous ir taps=%d chunks=[%s]",
+                        tap_count, ",".join("{:d}".format(chunk) for chunk in ir_chunks))
+            if check:
+                raise JTAGProbeError("IR capture insufficiently constrains IR lengths")
             return
 
-        if count is not None and len(irs) != count:
-            self._log_h("ir count does not match idcode count")
-            return
-
-        return irs
-
-    async def select_tap(self, tap, max_ir_length=128, max_dr_length=1024):
-        await self.test_reset()
-
-        dr_value = await self.scan_dr(max_dr_length)
-        if dr_value is None:
-            return
-
-        idcodes = self.segment_idcodes(dr_value)
-        if idcodes is None:
-            return
-
-        ir_value = await self.scan_ir(max_ir_length)
-        if ir_value is None:
-            return
-
-        irs = self.segment_irs(ir_value, count=len(idcodes))
-        if not irs:
-            return
-
-        if tap >= len(irs):
-            self._log_h("tap %d not present on chain")
-            return
-
-        ir_offset, ir_length = irs[tap]
-        total_ir_length = sum(length for offset, length in irs)
-
-        dr_offset, dr_length = tap, 1
-        total_dr_length = len(idcodes)
-
-        bypass = bits((1,))
-        def affix(offset, length, total_length):
-            prefix = bypass * offset
-            suffix = bypass * (total_length - offset - length)
-            return prefix, suffix
-
-        return TAPInterface(self, ir_length,
-            *affix(ir_offset, ir_length, total_ir_length),
-            *affix(dr_offset, dr_length, total_dr_length))
+    async def select_tap(self, index, *, ir_lengths=None):
+        dr_value, ir_value = await self.scan_reset_dr_ir()
+        idcodes = self.interrogate_dr(dr_value)
+        ir_layout = self.interrogate_ir(ir_value, tap_count=len(idcodes), ir_lengths=ir_lengths)
+        return TAPInterface.from_layout(self, ir_layout, index=index)
 
 
 class TAPInterface:
-    def __init__(self, lower, ir_length, ir_prefix, ir_suffix, dr_prefix, dr_suffix):
+    @classmethod
+    def from_layout(cls, lower, ir_layout, *, index):
+        if index not in range(len(ir_layout)):
+            raise JTAGProbeError("TAP #{:d} is not a part of {:d}-TAP chain"
+                                 .format(index, len(ir_layout)))
+
+        return cls(lower, ir_length=ir_layout[index],
+            ir_prefix=sum(ir_layout[:index]), ir_suffix=sum(ir_layout[index + 1:]),
+            dr_prefix=len(ir_layout[:index]), dr_suffix=len(ir_layout[index + 1:]))
+
+    def __init__(self, lower, *, ir_length, ir_prefix=0, ir_suffix=0, dr_prefix=0, dr_suffix=0):
         self.lower = lower
-        self.ir_length    = ir_length
-        self._ir_prefix   = ir_prefix
-        self._ir_suffix   = ir_suffix
-        self._ir_overhead = len(ir_prefix) + len(ir_suffix)
-        self._dr_prefix   = dr_prefix
-        self._dr_suffix   = dr_suffix
-        self._dr_overhead = len(dr_prefix) + len(dr_suffix)
+        self.ir_length  = ir_length
+        self._ir_prefix = ir_prefix
+        self._ir_suffix = ir_suffix
+        self._dr_prefix = dr_prefix
+        self._dr_suffix = dr_suffix
 
     async def test_reset(self):
         await self.lower.test_reset()
@@ -737,51 +828,53 @@ class TAPInterface:
     async def exchange_ir(self, data):
         data = bits(data)
         assert len(data) == self.ir_length
-        data = await self.lower.exchange_ir(self._ir_prefix + data + self._ir_suffix)
-        if self._ir_suffix:
-            return data[len(self._ir_prefix):-len(self._ir_suffix)]
-        else:
-            return data[len(self._ir_prefix):]
+        return await self.lower.exchange_ir(data,
+            prefix=self._ir_prefix, suffix=self._ir_suffix)
 
     async def read_ir(self):
-        data = await self.lower.read_ir(self._ir_overhead + self.ir_length)
-        if self._ir_suffix:
-            return data[len(self._ir_prefix):-len(self._ir_suffix)]
-        else:
-            return data[len(self._ir_prefix):]
+        return await self.lower.read_ir(self.ir_length,
+            prefix=self._ir_prefix, suffix=self._ir_suffix)
 
     async def write_ir(self, data, *, elide=True):
         data = bits(data)
         assert len(data) == self.ir_length
-        await self.lower.write_ir(self._ir_prefix + data + self._ir_suffix, elide=elide)
+        await self.lower.write_ir(data, elide=elide,
+            prefix=self._ir_prefix, suffix=self._ir_suffix)
 
     async def exchange_dr(self, data):
-        data = bits(data)
-        data = await self.lower.exchange_dr(self._dr_prefix + data + self._dr_suffix)
-        if self._dr_suffix:
-            return data[len(self._dr_prefix):-len(self._dr_suffix)]
-        else:
-            return data[len(self._dr_prefix):]
+        return await self.lower.exchange_dr(data,
+            prefix=self._dr_prefix, suffix=self._dr_suffix)
 
-    async def read_dr(self, count, idempotent=False):
-        data = await self.lower.read_dr(self._dr_overhead + count, idempotent=idempotent)
-        if self._dr_suffix:
-            return data[len(self._dr_prefix):-len(self._dr_suffix)]
-        else:
-            return data[len(self._dr_prefix):]
+    async def read_dr(self, length):
+        return await self.lower.read_dr(length,
+            prefix=self._dr_prefix, suffix=self._dr_suffix)
 
     async def write_dr(self, data):
-        data = bits(data)
-        await self.lower.write_dr(self._dr_prefix + data + self._dr_suffix)
+        await self.lower.write_dr(data,
+            prefix=self._dr_prefix, suffix=self._dr_suffix)
 
-    async def scan_dr_length(self, max_length, zero_ok=False):
-        length = await self.lower.scan_dr_length(max_length=self._dr_overhead + max_length,
-                                                 zero_ok=zero_ok)
-        if length is None or length == 0:
-            return
-        assert length >= self._dr_overhead
-        assert zero_ok or length - self._dr_overhead > 0
-        return length - self._dr_overhead
+    async def scan_dr(self, *, check=True, max_length=None):
+        if max_length is not None:
+            max_length = self._dr_prefix + max_length + self._dr_suffix
+        data = await self.lower.scan_dr(check=check, max_length=max_length)
+        if data is None:
+            return data
+        if check and len(data) == self._dr_prefix + self._dr_suffix:
+            raise JTAGProbeError("DR shift chain is empty")
+        assert len(data) > self._dr_prefix + self._dr_suffix
+        if self._dr_suffix:
+            return data[self._dr_prefix:-self._dr_suffix]
+        else:
+            return data[self._dr_prefix:]
+
+    async def scan_dr_length(self, *, max_length=None):
+        if max_length is not None:
+            max_length = self._dr_prefix + max_length + self._dr_suffix
+        length = await self.lower.scan_dr_length(max_length=max_length)
+        if length == self._dr_prefix + self._dr_suffix:
+            raise JTAGProbeError("DR shift chain is empty")
+        assert length > self._dr_prefix + self._dr_suffix
+        return length - self._dr_prefix - self._dr_suffix
 
 
 class JTAGProbeApplet(GlasgowApplet, name="jtag-probe"):
@@ -790,7 +883,6 @@ class JTAGProbeApplet(GlasgowApplet, name="jtag-probe"):
     description = """
     Identify, test and debug integrated circuits and board assemblies via IEEE 1149.1 JTAG.
     """
-    has_custom_repl = True
 
     __pins = ("tck", "tms", "tdi", "tdo", "trst")
 
@@ -815,173 +907,323 @@ class JTAGProbeApplet(GlasgowApplet, name="jtag-probe"):
             period_cyc=target.sys_clk_freq // (args.frequency * 1000),
         ))
 
-    async def run(self, device, args, reset=False):
-        iface = await device.demultiplexer.claim_interface(self, self.mux_interface, args)
-        jtag_iface = JTAGProbeInterface(iface, self.logger, has_trst=args.pin_trst is not None)
-        if reset:
-            if jtag_iface.has_trst:
-                await jtag_iface.pulse_trst()
-            else:
-                await jtag_iface.test_reset()
-        return jtag_iface
-
     @classmethod
-    def add_run_tap_arguments(cls, parser, access):
+    def add_run_arguments(cls, parser, access):
         super().add_run_arguments(parser, access)
 
         parser.add_argument(
-            "--tap-index", metavar="INDEX", type=int, default=0,
-            help="select TAP #INDEX for communication (default: %(default)s)")
+            "--scan-ir-max-length", metavar="LENGTH", type=int,
+            default=JTAGProbeInterface.scan_ir_max_length,
+            help="give up scanning IRs longer than LENGTH bits (default: %(default)s)")
+        parser.add_argument(
+            "--scan-dr-max-length", metavar="LENGTH", type=int,
+            default=JTAGProbeInterface.scan_dr_max_length,
+            help="give up scanning DRs longer than LENGTH bits (default: %(default)s)")
+
+        def ir_lengths(args):
+            lengths = []
+            for arg in args.split(","):
+                try:
+                    length = int(arg, 10)
+                    if length >= 2:
+                        lengths.append(length)
+                        continue
+                except ValueError:
+                    pass
+                raise argparse.ArgumentTypeError("{!r} is not a valid IR length"
+                                                 .format(arg))
+            return lengths
+
+        parser.add_argument(
+            "--ir-lengths", metavar="IR-LENGTH,...", default=None, type=ir_lengths,
+            help="set IR lengths of each TAP to corresponding IR-LENGTH (default: autodetect)")
+
+    async def run(self, device, args):
+        iface = await device.demultiplexer.claim_interface(self, self.mux_interface, args)
+        jtag_iface = JTAGProbeInterface(iface, self.logger, has_trst=args.pin_trst is not None)
+        jtag_iface.scan_ir_max_length = args.scan_ir_max_length
+        jtag_iface.scan_dr_max_length = args.scan_dr_max_length
+        return jtag_iface
+
+    @classmethod
+    def add_run_tap_arguments(cls, parser):
+        parser.add_argument(
+            "--tap-index", metavar="INDEX", type=int,
+            help="select TAP #INDEX for communication (default: select only TAP)")
 
     async def run_tap(self, cls, device, args):
         jtag_iface = await self.run_lower(cls, device, args)
-        tap_iface = await jtag_iface.select_tap(args.tap_index)
-        if not tap_iface:
-            raise JTAGProbeError("cannot select TAP #%d" % args.tap_index)
-        return tap_iface
+
+        dr_value, ir_value = await jtag_iface.scan_reset_dr_ir()
+        idcodes = jtag_iface.interrogate_dr(dr_value)
+        ir_layout = jtag_iface.interrogate_ir(ir_value,
+            tap_count=len(idcodes), ir_lengths=args.ir_lengths)
+
+        tap_index = args.tap_index
+        if tap_index is None:
+            if len(idcodes) > 1:
+                raise JTAGProbeError("multiple TAPs found; use explicit --tap-index")
+            else:
+                tap_index = 0
+        return TAPInterface.from_layout(jtag_iface, ir_layout, index=tap_index)
 
     @classmethod
     def add_interact_arguments(cls, parser):
-        parser.add_argument(
-            "--max-ir-length", metavar="LENGTH", type=int, default=128,
-            help="give up scanning IR after LENGTH bits")
-        parser.add_argument(
-            "--max-dr-length", metavar="LENGTH", type=int, default=1024,
-            help="give up scanning DR after LENGTH bits")
-
-        # TODO(py3.7): add required=True
-        p_operation = parser.add_subparsers(dest="operation", metavar="OPERATION")
+        p_operation = parser.add_subparsers(dest="operation", metavar="OPERATION", required=True)
 
         p_scan = p_operation.add_parser(
             "scan", help="scan JTAG chain and attempt to identify devices",
+            formatter_class=parser.formatter_class,
             description="""
             Reset the JTAG TAPs and shift IDCODE or BYPASS register values out to determine
-            the count and (hopefully) identity of the devices in the scan chain.
+            the count and (if available) identity of the devices in the scan chain.
             """)
 
         p_enumerate_ir = p_operation.add_parser(
-            "enumerate-ir", help="use heuristics to enumerate JTAG IR values (DANGEROUS)",
+            "enumerate-ir", help="(DANGEROUS) use heuristics to enumerate JTAG IR values",
+            formatter_class=parser.formatter_class,
             description="""
-            THIS COMMAND CAN HAVE POTENTIALLY DESTRUCTIVE CONSEQUENCES.
+            THIS COMMAND CAN PERMANENTLY DAMAGE DEVICE UNDER TEST.
 
-            IEEE 1149.1 requires that any unimplemented IR value select the BYPASS DR.
-            By exploiting this, and measuring DR lengths for every possible IR value,
-            we can discover DR lengths for every IR value.
+            IEEE 1149.1 requires every unimplemented IR value to select the BYPASS DR.
+            By selecting every possible IR value and measuring DR lengths, it is possible to
+            discover IR values that definitively correspond to non-BYPASS DRs.
 
-            Note that discovering DR length requires going through Capture-DR and Update-DR
-            states. While we strive to be as unobtrustive as possible by shifting the original
-            DR value back after we discover DR length, there is no guarantee that updating DR
-            with the captured DR value is side effect free. As such, this command can potentially
-            have UNPREDICTABLE side effects that, due to the nature of JTAG, can permanently
-            damage your target. Use with care.
+            Due to the design of JTAG state machine, measuring DR length requires going
+            through Capture-DR and Update-DR states for instructions that may have
+            IRREVERSIBLE or UNDEFINED behavior. Although this command updates the DR with
+            the data just captured from it, IEEE 1149.1 does not require this operation
+            to be idempotent. Additionally, many devices are not strictly compliant and
+            in practice may perform IRREVERSIBLE or UNDEFINED actions during operations
+            that IEEE 1149.1 requires to be benign, such as selecting an unimplemented
+            instruction, or shifting into DR. USE THIS COMMAND AT YOUR OWN RISK.
 
-            Note that while unimplemented IR values are required to select the BYPASS DR,
-            in practice, many apparently (from the documentation) unimplemented IR values
-            would actually select reserved DRs instead, which can lead to confusion. In some
-            cases they even select a constant 0 level on TDO!
+            DR length measurement can have one of the following four results:
+                * DR[n], n > 1: non-BYPASS n-bit DR.
+                * DR[1]: (likely) BYPASS or (less likely) non-BYPASS 1-bit DR.
+                  This result is not shown because most IR values correspond to DR[1].
+                * DR[0]: TDI connected directly to TDO.
+                  This is not allowed by IEEE 1149.1, but is very common in practice.
+                * DR[?]: (commonly) no connection to TDO or (less commonly) complex logic
+                  connected between TDI and TDO that is active during Shift-DR.
+                  This is not allowed by IEEE 1149.1, but is common in practice.
             """)
         p_enumerate_ir.add_argument(
             "tap_indexes", metavar="INDEX", type=int, nargs="+",
-            help="enumerate IR values for TAP #INDEX")
-
-        # This one is identical to run-repl, and is just for consistency when using the subcommands
-        # tap-repl and jtag-repl alternately.
-        p_jtag_repl = p_operation.add_parser(
-            "jtag-repl", help="drop into Python REPL")
-
-        p_tap_repl = p_operation.add_parser(
-            "tap-repl", help="select a TAP and drop into Python REPL")
-        p_tap_repl.add_argument(
-            "tap_index", metavar="INDEX", type=int, default=0, nargs="?",
-            help="select TAP #INDEX for communication (default: %(default)s)")
+            help="enumerate IR values for TAP(s) #INDEX")
 
     async def interact(self, device, args, jtag_iface):
-        if args.operation in ("scan", "enumerate-ir"):
-            await jtag_iface.test_reset()
+        dr_value, ir_value = await jtag_iface.scan_reset_dr_ir()
+        self.logger.info("shifted %d-bit DR=<%s>", len(dr_value), dump_bin(dr_value))
+        self.logger.info("shifted %d-bit IR=<%s>", len(ir_value), dump_bin(ir_value))
 
-            dr_value = await jtag_iface.scan_dr(max_length=args.max_dr_length)
-            if dr_value is None:
-                self.logger.warning("DR length scan did not terminate")
-                return
-            self.logger.info("shifted %d-bit DR=<%s>", len(dr_value), dump_bin(dr_value))
-
-            ir_value = await jtag_iface.scan_ir(max_length=args.max_ir_length)
-            if ir_value is None:
-                self.logger.warning("IR length scan did not terminate")
-                return
-            self.logger.info("shifted %d-bit IR=<%s>", len(ir_value), dump_bin(ir_value))
-
-            idcodes = jtag_iface.segment_idcodes(dr_value)
-            if not idcodes:
-                self.logger.warning("DR segmentation discovered no devices")
-                return
-            self.logger.info("DR segmentation discovered %d devices", len(idcodes))
-
-            irs = jtag_iface.segment_irs(ir_value, count=len(idcodes))
+        idcodes = jtag_iface.interrogate_dr(dr_value)
+        if len(idcodes) == 0:
+            self.logger.warning("DR interrogation discovered no TAPs")
+            return
+        self.logger.info("discovered %d TAPs", len(idcodes))
 
         if args.operation == "scan":
-            if not irs:
-                self.logger.warning("automatic IR segmentation failed")
-                irs = [(None, "?") for _ in idcodes]
+            ir_layout = jtag_iface.interrogate_ir(ir_value,
+                tap_count=len(idcodes), ir_lengths=args.ir_lengths, check=False)
+            if not ir_layout:
+                self.logger.warning("IR interrogation failed")
+                ir_layout = ["?" for _ in idcodes]
 
-            for tap_index, (idcode_value, (ir_offset, ir_length)) in enumerate(zip(idcodes, irs)):
+            for tap_index, (idcode_value, ir_length) in enumerate(zip(idcodes, ir_layout)):
                 if idcode_value is None:
                     self.logger.info("TAP #%d: IR[%s] BYPASS",
                                      tap_index, ir_length)
                 else:
                     idcode   = DR_IDCODE.from_int(idcode_value)
                     mfg_name = jedec_mfg_name_from_bank_num(idcode.mfg_id >> 7,
-                                                            idcode.mfg_id & 0x7f) or \
-                                    "unknown"
+                                                            idcode.mfg_id & 0x7f)
+                    if mfg_name is None:
+                        mfg_name = "unknown"
                     self.logger.info("TAP #%d: IR[%s] IDCODE=%#010x",
                                      tap_index, ir_length, idcode_value)
                     self.logger.info("manufacturer=%#05x (%s) part=%#06x version=%#03x",
                                      idcode.mfg_id, mfg_name, idcode.part_id, idcode.version)
 
         if args.operation == "enumerate-ir":
-            if not irs:
-                self.logger.error("automatic IR segmentation failed")
-                return
-
-            for tap_index in args.tap_indexes or range(len(irs)):
-                ir_offset, ir_length = irs[tap_index]
+            ir_layout = jtag_iface.interrogate_ir(ir_value,
+                tap_count=len(idcodes), ir_lengths=args.ir_lengths)
+            for tap_index in args.tap_indexes:
+                ir_length = ir_layout[tap_index]
                 self.logger.info("TAP #%d: IR[%d]", tap_index, ir_length)
 
-                tap_iface = await jtag_iface.select_tap(tap_index,
-                                                        args.max_ir_length, args.max_dr_length)
-                if not tap_iface:
-                    raise GlasgowAppletError("cannot select TAP #%d" % tap_index)
-
+                tap_iface = TAPInterface.from_layout(jtag_iface, ir_layout, index=tap_index)
                 for ir_value in range(0, (1 << ir_length)):
                     ir_value = bits(ir_value & (1 << bit) for bit in range(ir_length))
                     await tap_iface.test_reset()
                     await tap_iface.write_ir(ir_value)
-                    dr_length = await tap_iface.scan_dr_length(max_length=args.max_dr_length,
-                                                               zero_ok=True)
-                    if dr_length is None:
-                        level = logging.ERROR
+                    dr_value = await tap_iface.scan_dr(check=False)
+                    if dr_value is None:
                         dr_length = "?"
-                    elif dr_length == 0:
                         level = logging.WARN
-                    elif dr_length == 1:
-                        level = logging.DEBUG
                     else:
-                        level = logging.INFO
+                        dr_length = len(dr_value)
+                        if dr_length == 0:
+                            level = logging.WARN
+                        elif dr_length == 1:
+                            level = logging.DEBUG
+                        else:
+                            level = logging.INFO
                     self.logger.log(level, "  IR=%s DR[%s]", ir_value, dr_length)
 
-        if args.operation == "jtag-repl":
-            await AsyncInteractiveConsole(locals={"iface":jtag_iface}).interact()
+    @classmethod
+    def add_repl_arguments(cls, parser):
+        # Inheriting from the JTAG probe applet does not inherit the REPL.
+        if cls is not JTAGProbeApplet:
+            return super().add_repl_arguments(parser)
 
-        if args.operation == "tap-repl":
-            tap_iface = await jtag_iface.select_tap(args.tap_index,
-                                                    args.max_ir_length, args.max_dr_length)
-            if not tap_iface:
-                self.logger.error("cannot select TAP #%d" % args.tap_index)
-                return
+        parser.add_argument(
+            "--tap-index", metavar="INDEX", type=int,
+            help="select TAP #INDEX instead of the full chain")
 
-            await AsyncInteractiveConsole(locals={"iface":tap_iface}).interact()
+    async def repl(self, device, args, jtag_iface):
+        # See explanation in add_repl_arguments().
+        if type(self) is not JTAGProbeApplet:
+            return await super().repl(device, args, jtag_iface)
+
+        if args.tap_index is None:
+            iface = jtag_iface
+            self.logger.info("dropping to REPL for JTAG chain; "
+                             "use 'help(iface)' to see available APIs")
+        else:
+            iface = await jtag_iface.select_tap(args.tap_index, ir_lengths=args.ir_lengths)
+            self.logger.info("dropping to REPL for TAP #%d; "
+                             "use 'help(iface)' to see available APIs",
+                             args.tap_index)
+        await AsyncInteractiveConsole(
+            locals={"iface":iface},
+            run_callback=jtag_iface.flush
+        ).interact()
 
 # -------------------------------------------------------------------------------------------------
+
+import unittest
+
+
+class JTAGInterrogationTestCase(unittest.TestCase):
+    def setUp(self):
+        self.iface = JTAGProbeInterface(interface=None, logger=JTAGProbeApplet.logger)
+
+    def test_dr_empty(self):
+        self.assertEqual(self.iface.interrogate_dr(bits("")), [])
+
+    def test_dr_bypass(self):
+        self.assertEqual(self.iface.interrogate_dr(bits("0")), [None])
+
+    def test_dr_idcode(self):
+        dr = bits("00111011101000000000010001110111")
+        self.assertEqual(self.iface.interrogate_dr(dr), [0x3ba00477])
+
+    def test_dr_truncated(self):
+        dr = bits("0011101110100000000001000111011")
+        with self.assertRaisesRegex(JTAGProbeError,
+                r"^TAP #0 has truncated DR IDCODE=<1101110001000000000010111011100>$"):
+            self.iface.interrogate_dr(dr)
+        self.assertEqual(self.iface.interrogate_dr(dr, check=False), None)
+
+    def test_dr_bypass_idcode(self):
+        dr = bits("001110111010000000000100011101110")
+        self.assertEqual(self.iface.interrogate_dr(dr), [None, 0x3ba00477])
+
+    def test_dr_idcode_bypass(self):
+        dr = bits("000111011101000000000010001110111")
+        self.assertEqual(self.iface.interrogate_dr(dr), [0x3ba00477, None])
+
+    def test_dr_invalid(self):
+        dr = bits("00000000000000000000000011111111")
+        with self.assertRaisesRegex(JTAGProbeError,
+                r"^TAP #0 has invalid DR IDCODE=000000ff$"):
+            self.iface.interrogate_dr(dr)
+        self.assertEqual(self.iface.interrogate_dr(dr, check=False), None)
+
+    def test_ir_1tap_0start(self):
+        ir = bits("0100")
+        with self.assertRaisesRegex(JTAGProbeError,
+                r"^IR capture does not start with <10> transition$"):
+            self.iface.interrogate_ir(ir, 1)
+        self.assertEqual(self.iface.interrogate_ir(ir, 1, check=False),
+                         None)
+
+    def test_ir_1tap_0start_1length(self):
+        ir = bits("0100")
+        with self.assertRaisesRegex(JTAGProbeError,
+                r"^IR capture does not start with <10> transition$"):
+            self.iface.interrogate_ir(ir, 1, ir_lengths=[4])
+        self.assertEqual(self.iface.interrogate_ir(ir, 1, ir_lengths=[4], check=False),
+                         None)
+
+    def test_ir_1tap_1start(self):
+        ir = bits("0001")
+        self.assertEqual(self.iface.interrogate_ir(ir, 1),
+                         [4])
+
+    def test_ir_1tap_2start(self):
+        ir = bits("0101")
+        self.assertEqual(self.iface.interrogate_ir(ir, 1),
+                         [4])
+
+    def test_ir_1tap_2start_1length(self):
+        ir = bits("0101")
+        self.assertEqual(self.iface.interrogate_ir(ir, 1, ir_lengths=[4]),
+                         [4])
+
+    def test_ir_1tap_2start_1length_over(self):
+        ir = bits("0101")
+        with self.assertRaisesRegex(JTAGProbeError,
+                r"^IR capture length differs from sum of IR lengths$"):
+            self.iface.interrogate_ir(ir, 1, ir_lengths=[5])
+        self.assertEqual(self.iface.interrogate_ir(ir, 1, ir_lengths=[5], check=False),
+                         None)
+
+    def test_ir_2tap_1start(self):
+        ir = bits("0001")
+        with self.assertRaisesRegex(JTAGProbeError,
+                r"^IR capture has fewer <10> transitions than TAPs$"):
+            self.iface.interrogate_ir(ir, 2)
+        self.assertEqual(self.iface.interrogate_ir(ir, 2, check=False),
+                         None)
+
+    def test_ir_2tap_1start_2length(self):
+        ir = bits("0001")
+        with self.assertRaisesRegex(JTAGProbeError,
+                r"^IR capture has fewer <10> transitions than TAPs$"):
+            self.iface.interrogate_ir(ir, 2, ir_lengths=[2, 2])
+        self.assertEqual(self.iface.interrogate_ir(ir, 2, ir_lengths=[2, 2], check=False),
+                         None)
+
+    def test_ir_2tap_2start(self):
+        ir = bits("01001")
+        self.assertEqual(self.iface.interrogate_ir(ir, 2),
+                         [3, 2])
+
+    def test_ir_2tap_3start(self):
+        ir = bits("01001001")
+        with self.assertRaisesRegex(JTAGProbeError,
+                r"^IR capture insufficiently constrains IR lengths$"):
+            self.iface.interrogate_ir(ir, 2)
+        self.assertEqual(self.iface.interrogate_ir(ir, 2, check=False),
+                         None)
+
+    def test_ir_2tap_3start_1length(self):
+        ir = bits("01001001")
+        with self.assertRaisesRegex(JTAGProbeError,
+                r"^IR length count differs from TAP count$"):
+            self.iface.interrogate_ir(ir, 3, ir_lengths=[1])
+        self.assertEqual(self.iface.interrogate_ir(ir, 3, ir_lengths=[1], check=False),
+                         None)
+
+    def test_ir_2tap_3start_2length(self):
+        ir = bits("01001001")
+        self.assertEqual(self.iface.interrogate_ir(ir, 2, ir_lengths=[6, 2]),
+                         [6, 2])
+        self.assertEqual(self.iface.interrogate_ir(ir, 2, ir_lengths=[3, 5]),
+                         [3, 5])
+
 
 class JTAGProbeAppletTestCase(GlasgowAppletTestCase, applet=JTAGProbeApplet):
     @synthesis_test

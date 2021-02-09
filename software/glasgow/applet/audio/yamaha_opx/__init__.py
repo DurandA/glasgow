@@ -26,7 +26,7 @@
 # Bitstream format
 # ----------------
 #
-# The Yamaha DAC bitstream fromat is somewhat underdocumented and confusing. The DAC bitstream
+# The Yamaha DAC bitstream format is somewhat underdocumented and confusing. The DAC bitstream
 # has 16 bit dynamic range and uses 13 bit samples in a bespoke floating point format. These 13 bit
 # samples are padded to 16 bits and transmitted over a serial protocol similar to I²S.
 #
@@ -155,6 +155,7 @@ from ... import *
 
 class YamahaCPUBus(Module):
     def __init__(self, pads, master_cyc):
+        self.rst   = Signal()
         self.stb_m = Signal()
 
         self.a  = Signal(2)
@@ -190,6 +191,11 @@ class YamahaCPUBus(Module):
             self.comb += [
                 pads.cs_t.oe.eq(1),
                 pads.cs_t.o.eq(~self.cs),
+            ]
+        if hasattr(pads, "ic_t"):
+            self.comb += [
+                pads.ic_t.oe.eq(1),
+                pads.ic_t.o.eq(~self.rst),
             ]
 
 
@@ -241,6 +247,7 @@ class YamahaOPxSubtarget(Module):
         wait_timer  = Signal(16)
 
         enabled     = Signal()
+        self.comb += self.cpu_bus.rst.eq(~enabled)
 
         # The code below assumes that the FSM clock is under ~50 MHz, which frees us from the need
         # to explicitly satisfy setup/hold timings.
@@ -732,7 +739,8 @@ class YamahaVGMStreamPlayer(VGMStreamPlayer):
     async def play(self):
         try:
             await self._opx_iface.enable()
-            await self.wait_seconds(1.0)
+            # Flush out the state after reset.
+            await self._opx_iface.wait_clocks(self._opx_iface.sample_clocks * 1024)
             await self._reader.parse_data(self)
         finally:
             # Various parts of our stack are not completely synchronized to each other, resulting
@@ -742,6 +750,9 @@ class YamahaVGMStreamPlayer(VGMStreamPlayer):
             await self._opx_iface.disable()
 
     async def record(self, queue, chunk_count=16384):
+        # Skip a few initial samples that are used to flush state.
+        await self._opx_iface.read_samples(1024)
+
         total_count = int(self._reader.total_seconds / self.sample_time)
         done_count  = 0
         while done_count < total_count:
@@ -803,8 +814,11 @@ class YamahaOPxWebInterface:
                                          message=client_resp.reason)
                         return sock
 
-                    if ("Content-Length" not in client_resp.headers or
-                            int(client_resp.headers["Content-Length"]) > (1<<20)):
+                    if "Content-Length" not in client_resp.headers:
+                        await sock.close(code=2999, message=
+                            "Remote server did not specify Content-Length")
+                        return sock
+                    elif int(client_resp.headers["Content-Length"]) > (1<<20):
                         await sock.close(code=2999, message=
                             "File too large ({} bytes) to be fetched"
                             .format(client_resp.headers["Content-Length"]))
@@ -904,13 +918,19 @@ class YamahaOPxWebInterface:
                     if play_fut.done() and play_fut.exception():
                         break
 
-                    samples = await asyncio.wait_for(sample_queue.get(), timeout=1.0)
+                    samples = await asyncio.wait_for(sample_queue.get(), timeout=5.0)
                     if not samples:
                         break
                     await sock.send_bytes(samples)
 
                 for fut in [play_fut, record_fut]:
-                    await fut
+                    try:
+                        await fut
+                    except NotImplementedError as e:
+                        self._logger.exception("web: %s: error streaming",
+                                               digest)
+                        await sock.close(code=2000, message=str(e))
+                        return sock
 
                 self._logger.info("web: %s: done streaming",
                                   digest)
@@ -978,7 +998,7 @@ class AudioYamahaOPxApplet(GlasgowApplet, name="audio-yamaha-opx"):
     The written samples can be played with the knowledge of the sample rate, which is derived from
     the master clock frequency specified in the input file. E.g. using SoX:
 
-        $ play -r 49715 output.u16
+        $ play -r 49715 output.s16
 
     # Scripting
 
@@ -1005,20 +1025,23 @@ class AudioYamahaOPxApplet(GlasgowApplet, name="audio-yamaha-opx"):
 
     __pin_sets = ("d", "a")
     __pins = ("wr", "rd", "clk_m",
-              "sh", "mo", "clk_sy")
+              "sh", "mo", "clk_sy",
+              "cs", "ic")
 
     @classmethod
     def add_build_arguments(cls, parser, access):
         super().add_build_arguments(parser, access)
 
         access.add_pin_set_argument(parser, "d", width=8, default=True)
-        access.add_pin_set_argument(parser, "a", width=2, default=True)
+        access.add_pin_set_argument(parser, "a", width=range(1, 3), default=2)
         access.add_pin_argument(parser, "wr", default=True)
         access.add_pin_argument(parser, "rd", default=True)
         access.add_pin_argument(parser, "clk_m", default=True)
         access.add_pin_argument(parser, "sh", default=True)
         access.add_pin_argument(parser, "mo", default=True)
         access.add_pin_argument(parser, "clk_sy", default=True)
+        access.add_pin_argument(parser, "cs", required=False)
+        access.add_pin_argument(parser, "ic", required=False)
 
         parser.add_argument(
             "-d", "--device", metavar="DEVICE", choices=["OPL", "OPL2", "OPL3", "OPM"],
@@ -1091,8 +1114,7 @@ class AudioYamahaOPxApplet(GlasgowApplet, name="audio-yamaha-opx"):
 
     @classmethod
     def add_interact_arguments(cls, parser):
-        # TODO(py3.7): add required=True
-        p_operation = parser.add_subparsers(dest="operation", metavar="OPERATION")
+        p_operation = parser.add_subparsers(dest="operation", metavar="OPERATION", required=True)
 
         p_convert = p_operation.add_parser(
             "convert", help="convert VGM to PCM using Yamaha hardware")
@@ -1135,7 +1157,8 @@ class AudioYamahaOPxApplet(GlasgowApplet, name="audio-yamaha-opx"):
 
             vgm_player = YamahaVGMStreamPlayer(vgm_reader, opx_iface, clock_rate)
             sample_rate = 1 / vgm_player.sample_time
-            opx_iface.filter.sample_rate = sample_rate * self._opx_iface.sample_clocks
+            if opx_iface.filter:
+                opx_iface.filter.sample_rate = sample_rate * opx_iface.sample_clocks
             self.logger.info("recording %d channels at sample rate %d Hz",
                              opx_iface.channel_count, sample_rate)
 

@@ -1,6 +1,8 @@
 import re
 import argparse
+from abc import ABCMeta, abstractmethod
 
+from ..support.arepl import *
 from ..gateware.clockgen import *
 
 
@@ -11,31 +13,26 @@ class GlasgowAppletError(Exception):
     """An exception raised when an applet encounters an error."""
 
 
-class _GlasgowAppletMeta(type):
-    def __new__(metacls, clsname, bases, namespace, **kwargs):
-        # Any class that overrides interact() no longer has its superclass' custom REPL, so be
-        # helpful and reset that attribute.
-        if "has_custom_repl" not in namespace and "interact" in namespace:
-            namespace["has_custom_repl"] = False
-
-        return type.__new__(metacls, clsname, bases, namespace, **kwargs)
-
-
-class GlasgowApplet(metaclass=_GlasgowAppletMeta):
+class GlasgowAppletMeta(ABCMeta):
     all_applets = {}
 
-    def __init_subclass__(cls, name):
-        if name in cls.all_applets:
-            raise ValueError("Applet {!r} already exists".format(name))
+    def __new__(metacls, clsname, bases, namespace, name=None, **kwargs):
+        if name is not None:
+            if name in metacls.all_applets:
+                raise NameError(f"Applet {name!r} already exists")
+            namespace["name"] = name
 
-        cls.all_applets[name] = cls
-        cls.name = name
+        cls = ABCMeta.__new__(metacls, clsname, bases, namespace, **kwargs)
+        if name is not None:
+            metacls.all_applets[name] = cls
+        return cls
 
+
+class GlasgowApplet(metaclass=GlasgowAppletMeta):
     preview = False
     help = "applet help missing"
     description = "applet description missing"
     required_revision = "A0"
-    has_custom_repl = False
 
     @classmethod
     def add_build_arguments(cls, parser, access):
@@ -50,8 +47,9 @@ class GlasgowApplet(metaclass=_GlasgowAppletMeta):
             else:
                 raise GlasgowAppletError("clock {}: {}".format(clock_name, e))
 
+    @abstractmethod
     def build(self, target):
-        raise NotImplementedError
+        pass
 
     @classmethod
     def add_run_arguments(cls, parser, access):
@@ -60,15 +58,25 @@ class GlasgowApplet(metaclass=_GlasgowAppletMeta):
     async def run_lower(self, cls, device, args, **kwargs):
         return await super(cls, self).run(device, args, **kwargs)
 
+    @abstractmethod
     async def run(self, device, args):
-        raise NotImplementedError
+        pass
 
     @classmethod
     def add_interact_arguments(cls, parser):
         pass
 
-    async def interact(self, device, args, interface):
+    async def interact(self, device, args, iface):
         pass
+
+    @classmethod
+    def add_repl_arguments(cls, parser):
+        pass
+
+    async def repl(self, device, args, iface):
+        self.logger.info("dropping to REPL; use 'help(iface)' to see available APIs")
+        await AsyncInteractiveConsole(locals={"device":device, "iface":iface},
+            run_callback=device.demultiplexer.flush).interact()
 
 
 class GlasgowAppletTool:
@@ -95,7 +103,7 @@ import asyncio
 import threading
 import inspect
 import json
-from nmigen.compat.sim import *
+from nmigen.back.pysim import *
 
 from ..access.simulation import *
 from ..access.direct import *
@@ -248,8 +256,9 @@ class GlasgowAppletTestCase(unittest.TestCase):
         assert mode in ("record", "replay")
 
         if mode == "record":
+            self.device = None # in case the next line raises
             self.device = GlasgowHardwareDevice()
-            self.device.demultiplexer = DirectDemultiplexer(self.device)
+            self.device.demultiplexer = DirectDemultiplexer(self.device, pipe_count=1)
             revision = self.device.revision
         else:
             self.device = None
@@ -262,23 +271,23 @@ class GlasgowAppletTestCase(unittest.TestCase):
         self._recording = False
         self._recorders = []
 
-        async def run_lower(cls, device, args):
-            if cls is type(self.applet):
-                if mode == "record":
-                    lower_iface = await super(cls, self.applet).run(device, args)
-                    recorder = MockRecorder(case, lower_iface, fixture)
-                    self._recorders.append(recorder)
-                    return recorder
+        old_run_lower = self.applet.run_lower
 
-                if mode == "replay":
-                    return MockReplayer(case, fixture)
-            else:
-                return await super(cls, self.applet).run(device, args)
+        async def run_lower(cls, device, args):
+            if mode == "record":
+                lower_iface = await old_run_lower(cls, device, args)
+                recorder = MockRecorder(case, lower_iface, fixture)
+                self._recorders.append(recorder)
+                return recorder
+
+            if mode == "replay":
+                return MockReplayer(case, fixture)
+
         self.applet.run_lower = run_lower
 
     async def run_hardware_applet(self, mode):
         if mode == "record":
-            await self.device.download_target(self.target)
+            await self.device.download_target(self.target.build_plan())
 
         return await self.applet.run(self.device, self._parsed_args)
 
@@ -297,8 +306,16 @@ def applet_simulation_test(setup, args=[]):
             self._prepare_simulation_target()
 
             getattr(self, setup)()
+            @asyncio.coroutine
+            def run():
+                yield from case(self)
+
+            sim = Simulator(self.target)
+            sim.add_clock(1e-9)
+            sim.add_sync_process(run)
             vcd_name = "{}.vcd".format(case.__name__)
-            run_simulation(self.target, case(self), vcd_name=vcd_name)
+            with sim.write_vcd(vcd_name):
+                sim.run()
             os.remove(vcd_name)
 
         return wrapper
@@ -338,6 +355,10 @@ def applet_hardware_test(setup="run_hardware_applet", args=[]):
                         nonlocal exception
                         exception = e
 
+                    finally:
+                        if self.device is not None:
+                            loop.run_until_complete(self.device.demultiplexer.cancel())
+
                 thread = threading.Thread(target=run_test)
                 thread.start()
                 thread.join()
@@ -351,7 +372,8 @@ def applet_hardware_test(setup="run_hardware_applet", args=[]):
 
             finally:
                 if mode == "record":
-                    self.device.close()
+                    if self.device is not None:
+                        self.device.close()
 
         return wrapper
 

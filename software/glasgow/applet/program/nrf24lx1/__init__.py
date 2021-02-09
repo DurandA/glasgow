@@ -12,7 +12,7 @@ from nmigen.compat import *
 from fx2.format import input_data, output_data
 
 from ....support.logging import dump_hex
-from ...interface.spi_master import SPIMasterSubtarget, SPIMasterInterface
+from ...interface.spi_controller import SPIControllerSubtarget, SPIControllerInterface
 from ... import *
 
 
@@ -26,6 +26,18 @@ _MemoryArea = namedtuple("_MemoryArea", ("name", "mem_addr", "spi_addr", "size")
 _nrf24le1_map = [
     _MemoryArea(name="code",    mem_addr= 0x0000, spi_addr= 0x0000, size=0x4000),
     _MemoryArea(name="NV data", mem_addr= 0xFC00, spi_addr= 0x4400, size=0x0400),
+    _MemoryArea(name="info",    mem_addr=0x10000, spi_addr=0x10000, size=0x0200),
+]
+
+_nrf24lu1p_32k_map = [
+    _MemoryArea(name="code",    mem_addr= 0x0000, spi_addr= 0x0000, size=0x7C00),
+    _MemoryArea(name="NV data", mem_addr= 0x7C00, spi_addr= 0x7C00, size=0x0400),
+    _MemoryArea(name="info",    mem_addr=0x10000, spi_addr=0x10000, size=0x0200),
+]
+
+_nrf24lu1p_16k_map = [
+    _MemoryArea(name="code",    mem_addr= 0x0000, spi_addr= 0x0000, size=0x3C00),
+    _MemoryArea(name="NV data", mem_addr= 0x7C00, spi_addr= 0x7C00, size=0x0400),
     _MemoryArea(name="info",    mem_addr=0x10000, spi_addr=0x10000, size=0x0200),
 ]
 
@@ -48,7 +60,7 @@ class ProgramNRF24Lx1Interface:
         self._addr_dut_reset = addr_dut_reset
 
     def _log(self, message, *args):
-        self._logger.log(self._level, "nRF24LX1: " + message, *args)
+        self._logger.log(self._level, "nRF24Lx1: " + message, *args)
 
     async def _reset(self):
         await self._device.write_register(self._addr_dut_reset, 1)
@@ -131,12 +143,12 @@ class ProgramNRF24Lx1Interface:
 
 class ProgramNRF24Lx1Applet(GlasgowApplet, name="program-nrf24lx1"):
     logger = logging.getLogger(__name__)
-    help = "program nRF24LE1 RF microcontrollers"
+    help = "program nRF24LE1 and nRF24LU1+ RF microcontrollers"
     description = """
-    Program the non-volatile memory of nRF24LE1 microcontrollers.
+    Program the non-volatile memory of nRF24LE1 and nRF24LU1+ microcontrollers.
     """
 
-    __pins = ("prog", "sck", "mosi", "miso", "ss", "reset")
+    __pins = ("prog", "sck", "copi", "cipo", "cs", "reset")
 
     @classmethod
     def add_build_arguments(cls, parser, access):
@@ -145,9 +157,9 @@ class ProgramNRF24Lx1Applet(GlasgowApplet, name="program-nrf24lx1"):
         # Order matches the pin order, in clockwise direction.
         access.add_pin_argument(parser, "prog",  default=True)
         access.add_pin_argument(parser, "sck",   default=True)
-        access.add_pin_argument(parser, "mosi",  default=True)
-        access.add_pin_argument(parser, "miso",  default=True)
-        access.add_pin_argument(parser, "ss",    default=True)
+        access.add_pin_argument(parser, "copi",  default=True)
+        access.add_pin_argument(parser, "cipo",  default=True)
+        access.add_pin_argument(parser, "cs",    default=True)
         access.add_pin_argument(parser, "reset", default=True)
 
         parser.add_argument(
@@ -161,7 +173,7 @@ class ProgramNRF24Lx1Applet(GlasgowApplet, name="program-nrf24lx1"):
         self.mux_interface = iface = target.multiplexer.claim_interface(self, args)
         pads = iface.get_pads(args, pins=self.__pins)
 
-        subtarget = iface.add_subtarget(SPIMasterSubtarget(
+        subtarget = iface.add_subtarget(SPIControllerSubtarget(
             pads=pads,
             out_fifo=iface.get_out_fifo(),
             in_fifo=iface.get_in_fifo(auto_flush=True),
@@ -169,7 +181,7 @@ class ProgramNRF24Lx1Applet(GlasgowApplet, name="program-nrf24lx1"):
             delay_cyc=math.ceil(target.sys_clk_freq / 1e6),
             sck_idle=0,
             sck_edge="rising",
-            ss_active=0,
+            cs_active=0,
         ))
         subtarget.comb += [
             pads.prog_t.o.eq(dut_prog),
@@ -183,15 +195,19 @@ class ProgramNRF24Lx1Applet(GlasgowApplet, name="program-nrf24lx1"):
 
     async def run(self, device, args):
         iface = await device.demultiplexer.claim_interface(self, self.mux_interface, args)
-        spi_iface = SPIMasterInterface(iface, self.logger)
+        spi_iface = SPIControllerInterface(iface, self.logger)
         nrf24lx1_iface = ProgramNRF24Lx1Interface(spi_iface, self.logger, device,
                                                   self.__addr_dut_prog, self.__addr_dut_reset)
         return nrf24lx1_iface
 
     @classmethod
     def add_interact_arguments(cls, parser):
-        # TODO(py3.7): add required=True
-        p_operation = parser.add_subparsers(dest="operation", metavar="OPERATION")
+        parser.add_argument(
+            "-d", "--device", metavar="DEVICE", required=True,
+            choices=("LE1", "LU1p16k", "LU1p32k"),
+            help="type of device to program (one of: %(choices)s)")
+
+        p_operation = parser.add_subparsers(dest="operation", metavar="OPERATION", required=True)
 
         p_read = p_operation.add_parser(
             "read", help="read MCU memory contents")
@@ -221,8 +237,18 @@ class ProgramNRF24Lx1Applet(GlasgowApplet, name="program-nrf24lx1"):
             "enable-debug", help="enable MCU hardare debugging features")
 
     async def interact(self, device, args, nrf24lx1_iface):
-        memory_map = _nrf24le1_map
-        page_size  = 512
+        page_size = 512
+        if args.device == "LE1":
+            memory_map  = _nrf24le1_map
+            buffer_size = 512
+        elif args.device == "LU1p32k":
+            memory_map  = _nrf24lu1p_32k_map
+            buffer_size = 256
+        elif args.device == "LU1p16k":
+            memory_map  = _nrf24lu1p_16k_map
+            buffer_size = 256
+        else:
+            assert False
 
         try:
             await nrf24lx1_iface.reset_program()
@@ -297,9 +323,10 @@ class ProgramNRF24Lx1Applet(GlasgowApplet, name="program-nrf24lx1"):
                         (chunk_spi_addr + len(chunk_data) + page_size - 1) // page_size))
                     need_erase_pages = overwrite_pages - erased_pages
                     if need_erase_pages:
-                        self.logger.log(level, "erasing %s memory at %#06x+%#06x",
-                                        memory_area.name, chunk_mem_addr, len(chunk_data))
                         for page in need_erase_pages:
+                            page_addr = (memory_area.spi_addr & 0x10000) | (page * page_size)
+                            self.logger.log(level, "erasing %s memory at %#06x+%#06x",
+                                            memory_area.name, page_addr, page_size)
                             await nrf24lx1_iface.write_enable()
                             await nrf24lx1_iface.erase_page(page)
                             await nrf24lx1_iface.wait_status()
@@ -309,10 +336,10 @@ class ProgramNRF24Lx1Applet(GlasgowApplet, name="program-nrf24lx1"):
                                     memory_area.name, chunk_mem_addr, len(chunk_data))
                     while len(chunk_data) > 0:
                         await nrf24lx1_iface.write_enable()
-                        await nrf24lx1_iface.program(chunk_spi_addr, chunk_data[:page_size])
+                        await nrf24lx1_iface.program(chunk_spi_addr, chunk_data[:buffer_size])
                         await nrf24lx1_iface.wait_status()
-                        chunk_data  = chunk_data[page_size:]
-                        chunk_spi_addr += page_size
+                        chunk_data  = chunk_data[buffer_size:]
+                        chunk_spi_addr += buffer_size
 
             if args.operation == "erase":
                 if args.info_page:

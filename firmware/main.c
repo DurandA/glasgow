@@ -269,7 +269,9 @@ static void descriptors_init() {
 }
 
 enum {
-  // Glasgow requests
+  // Glasgow API level request
+  USB_REQ_API_LEVEL    = 0x0F,
+  // Glasgow API requests
   USB_REQ_EEPROM       = 0x10,
   USB_REQ_FPGA_CFG     = 0x11,
   USB_REQ_STATUS       = 0x12,
@@ -309,24 +311,22 @@ enum {
 // an USB timeout, and we want to indicate error conditions faster.
 static uint8_t status;
 
-static void update_leds() {
-  led_err_set(status & (ST_ERROR | ST_ALERT));
-  led_fpga_set(status & ST_FPGA_RDY);
+static void update_err_led() {
+  if(status & (ST_ERROR | ST_ALERT))
+    IOD |=  (1<<PIND_LED_ERR);
+  else
+    IOD &= ~(1<<PIND_LED_ERR);
 }
 
 static void latch_status_bit(uint8_t bit) {
   status |= bit;
-  update_leds();
-}
-
-static bool check_status_bit(uint8_t bit) {
-  return status & bit;
+  update_err_led();
 }
 
 static bool reset_status_bit(uint8_t bit) {
   if(status & bit) {
     status &= ~bit;
-    update_leds();
+    update_err_led();
     return true;
   }
   return false;
@@ -516,7 +516,8 @@ void handle_pending_usb_setup() {
     pending_setup = false;
 
     while(EP0CS & _BUSY);
-    EP0BUF[0] = status;
+    EP0BUF[0] = status |
+      (fpga_is_ready() ? ST_FPGA_RDY : 0);
     SETUP_EP0_BUF(1);
 
     reset_status_bit(ST_ERROR);
@@ -533,7 +534,6 @@ void handle_pending_usb_setup() {
     pending_setup = false;
 
     if(arg_idx == 0) {
-      reset_status_bit(ST_FPGA_RDY);
       memset(glasgow_config.bitstream_id, 0, BITSTREAM_ID_SIZE);
       fpga_reset();
     }
@@ -565,10 +565,7 @@ void handle_pending_usb_setup() {
       xmemcpy(EP0BUF, glasgow_config.bitstream_id, BITSTREAM_ID_SIZE);
       SETUP_EP0_BUF(BITSTREAM_ID_SIZE);
     } else {
-      fpga_start();
-      if(fpga_is_ready()) {
-        latch_status_bit(ST_FPGA_RDY);
-
+      if(fpga_start()) {
         SETUP_EP0_BUF(0);
         while(EP0CS & _BUSY);
         xmemcpy(glasgow_config.bitstream_id, EP0BUF, BITSTREAM_ID_SIZE);
@@ -613,9 +610,16 @@ void handle_pending_usb_setup() {
      req->wLength == 2) {
     uint8_t  arg_mask = req->wIndex;
     pending_setup = false;
+    bool result;
 
     while(EP0CS & _BUSY);
-    if(!iobuf_measure_voltage(arg_mask, (__xdata uint16_t *)EP0BUF)) {
+
+    if(glasgow_config.revision == GLASGOW_REV_C2)
+      result = iobuf_measure_voltage_ina233(arg_mask, (__xdata uint16_t *)EP0BUF);
+    else
+      result = iobuf_measure_voltage_adc081c(arg_mask, (__xdata uint16_t *)EP0BUF);
+
+    if(!result) {
       STALL_EP0();
     } else {
       SETUP_EP0_BUF(2);
@@ -632,10 +636,17 @@ void handle_pending_usb_setup() {
     bool     arg_get = (req->bmRequestType & USB_DIR_IN);
     uint8_t  arg_mask = req->wIndex;
     pending_setup = false;
+    bool result;
 
     if(arg_get) {
       while(EP0CS & _BUSY);
-      if(!iobuf_get_alert(arg_mask, (__xdata uint16_t *)EP0BUF, (__xdata uint16_t *)EP0BUF + 1)) {
+
+      if(glasgow_config.revision == GLASGOW_REV_C2)
+        result = iobuf_get_alert_ina233(arg_mask, (__xdata uint16_t *)EP0BUF, (__xdata uint16_t *)EP0BUF + 1);
+      else
+        result = iobuf_get_alert_adc081c(arg_mask, (__xdata uint16_t *)EP0BUF, (__xdata uint16_t *)EP0BUF + 1);
+
+      if(!result) {
         STALL_EP0();
       } else {
         SETUP_EP0_BUF(4);
@@ -643,7 +654,14 @@ void handle_pending_usb_setup() {
     } else {
       SETUP_EP0_BUF(4);
       while(EP0CS & _BUSY);
-      if(!iobuf_set_alert(arg_mask, (__xdata uint16_t *)EP0BUF, (__xdata uint16_t *)EP0BUF + 1)) {
+
+      if(glasgow_config.revision == GLASGOW_REV_C2)
+        // TODO
+        result = true;
+      else
+        result = iobuf_set_alert_adc081c(arg_mask, (__xdata uint16_t *)EP0BUF, (__xdata uint16_t *)EP0BUF + 1);
+
+      if(!result) {
         latch_status_bit(ST_ERROR);
       }
     }
@@ -658,7 +676,7 @@ void handle_pending_usb_setup() {
     pending_setup = false;
 
     while(EP0CS & _BUSY);
-    iobuf_poll_alert(EP0BUF, /*clear=*/true);
+    iobuf_poll_alert_adc081c(EP0BUF, /*clear=*/true);
     SETUP_EP0_BUF(1);
 
     reset_status_bit(ST_ALERT);
@@ -747,6 +765,17 @@ void handle_pending_usb_setup() {
     return;
   }
 
+  if(req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN) &&
+     req->bRequest == USB_REQ_API_LEVEL &&
+     req->wLength == 1) {
+    pending_setup = false;
+
+    while(EP0CS & _BUSY);
+    EP0BUF[0] = CUR_API_LEVEL;
+    SETUP_EP0_BUF(1);
+    return;
+  }
+
   // ATECC requests
   if(((req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN) &&
       req->wLength == 64) ||
@@ -807,21 +836,30 @@ void handle_pending_usb_setup() {
   STALL_EP0();
 }
 
-volatile bool pending_alert;
+// Directly use the irq enable register EX0 to notify about a pending alert to avoid using
+// a separate variable which could get out of sync. 
+// Define it to armed_alert to document this usage pattern 
+#define armed_alert EX0
 
 void isr_IE0() __interrupt(_INT_IE0) {
-  pending_alert = true;
+  // INT_IE0 is level triggered, the ~ALERT line is continuously pulled low by the ADC
+  // So disable this irq unil we have fully handled it, otherwise it permanently triggers
+  armed_alert = false;
 }
 
 void handle_pending_alert() {
   __xdata uint8_t mask;
   __xdata uint16_t millivolts = 0;
 
-  pending_alert = false;
-
   latch_status_bit(ST_ALERT);
-  iobuf_poll_alert(&mask, /*clear=*/false);
+  iobuf_poll_alert_adc081c(&mask, /*clear=*/false);
   iobuf_set_voltage(mask, &millivolts);
+
+  // TODO: handle i2c comms errors of above calls
+
+  // the ADC that pulled the ~ALERT line should have released it by now
+  // so we can re-enable the interrupt to catch the next alert
+  armed_alert = true;
 }
 
 void isr_TF2() __interrupt(_INT_TF2) {
@@ -859,9 +897,16 @@ int main() {
   config_init();
   config_fixup();
   descriptors_init();
-  leds_init();
   iobuf_init_dac_ldo();
-  iobuf_init_adc();
+
+  if(glasgow_config.revision == GLASGOW_REV_C2) {
+    if (!iobuf_init_adc_ina233())
+      latch_status_bit(ST_ERROR);
+  }
+  else
+    iobuf_init_adc_adc081c();
+
+  fpga_init();
   fifo_init();
   atecc_init(&atecc_packet);
 
@@ -871,6 +916,11 @@ int main() {
   SYNCDELAY;
   EP1OUTCFG = 0;
 
+  // Set up LEDs.
+  OED |= (1<<PIND_LED_FX2)|(1<<PIND_LED_ACT)|(1<<PIND_LED_ERR);
+  IOD |= (1<<PIND_LED_FX2);
+  IOD &=                 ~((1<<PIND_LED_ACT)|(1<<PIND_LED_ERR));
+
   // Use timer 2 in 16-bit timer mode for ACT LED.
   T2CON = _CPRL2;
   ET2 = true;
@@ -878,8 +928,8 @@ int main() {
   // Set up endpoint interrupts for ACT LED.
   EPIE |= _EPI_EP0IN|_EPI_EP0OUT|_EPI_EP2|_EPI_EP4|_EPI_EP6|_EPI_EP8;
 
-  // Set up interrupt for ADC ALERT.
-  EX0 = true;
+  // Set up interrupt for ADC ALERT, see documentation at the armed_alert definition for details
+  armed_alert = true;
 
   // If there's a bitstream flashed, load it.
   if(glasgow_config.bitstream_size > 0) {
@@ -888,7 +938,7 @@ int main() {
     uint16_t addr = 0;
 
     // Loading the bitstream over I2C can take up to five seconds.
-    led_act_set(true);
+    IOD |=  (1<<PIND_LED_ACT);
 
     fpga_reset();
     while(length > 0) {
@@ -915,19 +965,12 @@ int main() {
       }
     }
     if(length == 0) {
-      fpga_start();
-      if(!fpga_is_ready())
+      if(!fpga_start())
         latch_status_bit(ST_ERROR);
     }
 
-    led_act_set(false);
+    IOD &= ~(1<<PIND_LED_ACT);
   }
-
-  // Latch initial status bits.
-  // FPGA could be ready because we've loaded it above, or because the firmware was
-  // reloaded live.
-  if(fpga_is_ready())
-    latch_status_bit(ST_FPGA_RDY);
 
   // Finally, enumerate.
   usb_init(/*reconnect=*/true);
@@ -935,7 +978,7 @@ int main() {
   while(1) {
     if(pending_setup)
       handle_pending_usb_setup();
-    if(pending_alert)
+    if(!armed_alert)
       handle_pending_alert();
   }
 }

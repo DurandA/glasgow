@@ -9,7 +9,7 @@ import asyncio
 from ....support.aobject import *
 from ....support.endpoint import *
 from ....support.bits import *
-from ....support.pyrepl import *
+from ....support.arepl import *
 from ....arch.mips import *
 from ....protocol.gdb_remote import *
 from ...interface.jtag_probe import JTAGProbeApplet
@@ -59,6 +59,7 @@ class EJTAGDebugInterface(aobject, GDBRemote):
 
     async def _exchange_control(self, **fields):
         control = self._control.copy()
+        control.PrAcc = 1
         if self._impcode.EJTAGver > 0:
             # Some (but not all) EJTAG 1.x/2.0 cores implement Rocc handshaking. We ignore it,
             # since there's no easy way to tell which one it is (on some Lexra cores, Rocc appears
@@ -829,11 +830,11 @@ class DebugMIPSApplet(JTAGProbeApplet, name="debug-mips"):
     Other configurations might or might not work. In particular, it certainly does not currently
     work on little-endian CPUs. Sorry about that.
     """
-    has_custom_repl = True
 
     @classmethod
     def add_run_arguments(cls, parser, access):
-        super().add_run_tap_arguments(parser, access)
+        super().add_run_arguments(parser, access)
+        super().add_run_tap_arguments(parser)
 
     async def run(self, device, args):
         tap_iface = await self.run_tap(DebugMIPSApplet, device, args)
@@ -841,8 +842,7 @@ class DebugMIPSApplet(JTAGProbeApplet, name="debug-mips"):
 
     @classmethod
     def add_interact_arguments(cls, parser):
-        # TODO(py3.7): add required=True
-        p_operation = parser.add_subparsers(dest="operation", metavar="OPERATION")
+        p_operation = parser.add_subparsers(dest="operation", metavar="OPERATION", required=True)
 
         p_dump_state = p_operation.add_parser(
             "dump-state", help="dump CPU state")
@@ -878,9 +878,9 @@ class DebugMIPSApplet(JTAGProbeApplet, name="debug-mips"):
                 if ejtag_iface.target_attached():
                     await ejtag_iface.target_detach()
 
-        if args.operation == "repl":
-            await AsyncInteractiveConsole(locals={"iface":ejtag_iface}).interact()
+    async def repl(self, device, args, ejtag_iface):
+        await super().repl(device, args, ejtag_iface)
 
-            # Same as above.
-            if ejtag_iface.target_attached():
-                await ejtag_iface.target_detach()
+        # Same reason as above.
+        if ejtag_iface.target_attached():
+            await ejtag_iface.target_detach()

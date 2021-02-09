@@ -23,10 +23,10 @@ from .. import AccessDemultiplexer, AccessDemultiplexerInterface
 #   On the other hand, we would like to prevent programs from submitting a
 #   lot of small URBs and using up all the DMA-able kernel memory. [...]
 #
-# In other words, there is be a platform-specific limit for USB I/O size, which is not
-# discoverable via libusb, and hitting which does not result in a sensible error returned
-# from libusb (it returns LIBUSB_ERROR_IO even though USBDEVFS_SUBMITURB ioctl correctly
-# returns -ENOMEM), so it is not even possible to be optimistic and back off after hitting it.
+# In other words, there is a platform-specific limit for USB I/O size, which is not discoverable
+# via libusb, and hitting which does not result in a sensible error returned  from libusb
+# (it returns LIBUSB_ERROR_IO even though USBDEVFS_SUBMITURB ioctl correctly returns -ENOMEM),
+# so it is not even possible to be optimistic and back off after hitting it.
 #
 # To deal with this, use requests of at most 1024 EP buffer sizes (512 KiB with the FX2) as
 # an arbitrary cutoff, and hope for the best.
@@ -54,7 +54,7 @@ _max_packets_per_ep = 1024
 # a single fixed value works.
 _packets_per_xfer = 32
 
-# Queue as many transfers as we can, but no more than 10, as the returns beyond that point
+# Queue as many transfers as we can, but no more than 16, as the returns beyond that point
 # are diminishing.
 _xfers_per_queue = min(16, _max_packets_per_ep // _packets_per_xfer)
 
@@ -177,14 +177,14 @@ class DirectDemultiplexerInterface(AccessDemultiplexerInterface):
         self._out_tasks  = TaskQueue()
         self._out_buffer = ChunkedFIFO()
 
+        self._in_stalls  = 0
+        self._out_stalls = 0
+
     async def cancel(self):
         if self._in_tasks or self._out_tasks:
             self.logger.trace("FIFO: cancelling operations")
-            self._in_tasks .cancel()
-            self._out_tasks.cancel()
-            # libusb cancellation is asynchronous, so wait until it's actually done.
-            await self._in_tasks .wait_all()
-            await self._out_tasks.wait_all()
+            await self._in_tasks .cancel()
+            await self._out_tasks.cancel()
 
     async def reset(self):
         await self.cancel()
@@ -225,7 +225,7 @@ class DirectDemultiplexerInterface(AccessDemultiplexerInterface):
     async def read(self, length=None, *, flush=True):
         if flush and len(self._out_buffer) > 0:
             # Flush the buffer, so that everything written before the read reaches the device.
-            await self.flush()
+            await self.flush(wait=False)
 
         if length is None and len(self._in_buffer) > 0:
             # Just return whatever is in the buffer.
@@ -234,10 +234,12 @@ class DirectDemultiplexerInterface(AccessDemultiplexerInterface):
             # Return whatever is received in the next transfer, even if it's nothing.
             # (Gateware doesn't normally submit zero-length packets, so, unless that changes
             # or customized gateware is used, we'll always get some data here.)
+            self._in_stalls += 1
             await self._in_tasks.wait_one()
             length = len(self._in_buffer)
         else:
             # Return exactly the requested length.
+            self._in_stalls += 1
             while len(self._in_buffer) < length:
                 self.logger.trace("FIFO: need %d bytes", length - len(self._in_buffer))
                 await self._in_tasks.wait_one()
@@ -300,6 +302,8 @@ class DirectDemultiplexerInterface(AccessDemultiplexerInterface):
         if self._write_buffer_size is not None:
             # If write buffer is bounded, and we have more inflight requests than the configured
             # write buffer size, then wait until the inflight requests arrive before continuing.
+            if self._out_inflight >= self._write_buffer_size:
+                self._out_stalls += 1
             while self._out_inflight >= self._write_buffer_size:
                 self.logger.trace("FIFO: write pushback")
                 await self._out_tasks.wait_one()
@@ -340,6 +344,8 @@ class DirectDemultiplexerInterface(AccessDemultiplexerInterface):
 
         # First, we ensure we can submit one more task. (There can be more tasks than
         # _xfers_per_queue because a task may spawn another one just before it terminates.)
+        if len(self._out_tasks) >= _xfers_per_queue:
+            self._out_stalls += 1
         while len(self._out_tasks) >= _xfers_per_queue:
             await self._out_tasks.wait_one()
 
@@ -357,4 +363,26 @@ class DirectDemultiplexerInterface(AccessDemultiplexerInterface):
 
         if wait:
             self.logger.trace("FIFO: wait for flush")
-            await self._out_tasks.wait_all()
+            if self._out_tasks:
+                self._out_stalls += 1
+            while self._out_tasks:
+                await self._out_tasks.wait_all()
+
+    def statistics(self):
+        self.logger.info("FIFO statistics:")
+        self.logger.info("  read total    : %d B",
+                         self._in_buffer.total_read_bytes)
+        self.logger.info("  written total : %d B",
+                         self._out_buffer.total_written_bytes)
+        self.logger.info("  reads waited  : %.3f s",
+                         self._in_tasks.total_wait_time)
+        self.logger.info("  writes waited : %.3f s",
+                         self._out_tasks.total_wait_time)
+        self.logger.info("  read stalls   : %d",
+                         self._in_stalls)
+        self.logger.info("  write stalls  : %d",
+                         self._out_stalls)
+        self.logger.info("  read wakeups  : %d",
+                         self._in_tasks.total_wait_count)
+        self.logger.info("  write wakeups : %d",
+                         self._out_tasks.total_wait_count)

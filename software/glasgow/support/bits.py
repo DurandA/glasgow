@@ -114,7 +114,7 @@ class bits:
     def __getitem__(self, key):
         if isinstance(key, int):
             if key < 0:
-                return (self._int_ >> (self._len_ - key)) & 1
+                return (self._int_ >> (self._len_ + key)) & 1
             else:
                 return (self._int_ >> key) & 1
         if isinstance(key, slice):
@@ -188,6 +188,18 @@ class bits:
             if (self._int_ >> bit) & 1:
                 value |= 1
         return self.__class__(value, self._len_)
+
+    def find(self, sub, start=0, end=-1):
+        sub = self.__class__(sub)
+        if start < 0:
+            start = self._len_ - start
+        if end < 0:
+            end = self._len_ - end
+        for pos in range(start, end):
+            if self[pos:pos + len(sub)] == sub:
+                return pos
+        else:
+            return -1
 
 # -------------------------------------------------------------------------------------------------
 
@@ -300,6 +312,9 @@ class BitsTestCase(unittest.TestCase):
         self.assertEqual(some[0], 1)
         self.assertEqual(some[2], 0)
         self.assertEqual(some[5], 0)
+        self.assertEqual(some[-1], 1)
+        self.assertEqual(some[-2], 0)
+        self.assertEqual(some[-5], 1)
 
     def test_getitem_slice(self):
         some = bits("10001001011")
@@ -353,3 +368,16 @@ class BitsTestCase(unittest.TestCase):
 
     def test_reversed(self):
         self.assertBits(bits("1010").reversed(), 4, 0b0101)
+
+    def test_find(self):
+        self.assertEqual(bits("1011").find(bits("11")), 0)
+        self.assertEqual(bits("1011").find(bits("10")), 2)
+        self.assertEqual(bits("1011").find(bits("01")), 1)
+        self.assertEqual(bits("1011").find(bits("00")), -1)
+
+        self.assertEqual(bits("101100101").find(bits("10"), 0), 1)
+        self.assertEqual(bits("101100101").find(bits("10"), 2), 4)
+        self.assertEqual(bits("101100101").find(bits("10"), 5), 7)
+        self.assertEqual(bits("101100101").find(bits("10"), 8), -1)
+
+        self.assertEqual(bits("1011").find(bits((1,0))), 1)
