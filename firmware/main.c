@@ -291,8 +291,8 @@ enum {
   // Microsoft requests
   USB_REQ_GET_MS_DESCRIPTOR = 0xC0,
   // ATECC requests
-  USB_REQ_ATECC_SIGN   = 0x20,
-  USB_REQ_ATECC_CERT   = 0x21,
+  USB_REQ_ATECC_READ   = 0x20,
+  USB_REQ_ATECC_SIGN   = 0x21,
 };
 
 enum {
@@ -397,7 +397,6 @@ uint16_t bitstream_idx;
 
 void handle_pending_usb_setup() {
   __xdata struct usb_req_setup *req = (__xdata struct usb_req_setup *)SETUPDAT;
-  __xdata uint8_t cert[32] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31};
 
   // EEPROM read/write requests
   if(req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_OUT) &&
@@ -805,13 +804,27 @@ void handle_pending_usb_setup() {
   }
 
   if((req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN)) &&
-     req->bRequest == USB_REQ_ATECC_CERT &&
-     req->wLength == 32) {
+     req->bRequest == USB_REQ_ATECC_READ) {
+    uint8_t arg_slot = req->wValue;
+    uint8_t arg_offset = req->wIndex;
+    uint8_t arg_len = req->wLength;
     pending_setup = false;
 
-    while(EP0CS & _BUSY);
-    xmemcpy(EP0BUF, cert, 32);
-    SETUP_EP0_BUF(32);
+    atecc_wake();
+    delay_us(1500);
+    while(arg_len > 0) {
+      uint8_t chunk_len = arg_len < 64 ? arg_len : 64;
+
+      while(EP0CS & _BUSY);
+      if(!atecc_read_data(&atecc_packet, arg_slot, arg_offset, EP0BUF)) {
+        STALL_EP0();
+        break;
+      }
+      SETUP_EP0_BUF(chunk_len);
+
+      arg_len  -= chunk_len;
+      arg_offset += 1;
+    }
 
     return;
   }

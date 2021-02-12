@@ -134,6 +134,8 @@ void fifo_configure(bool two_ep);
 void fifo_reset(bool two_ep, uint8_t interfaces);
 
 // ATECC API
+#define ZONE_DATA                   ((uint8_t)0x02)
+#define ZONE_READWRITE_32           ((uint8_t)0x80)
 #define NONCE_MODE_PASSTHROUGH          ((uint8_t)0x03)
 #define NONCE_MODE_INPUT_LEN_32         ((uint8_t)0x00)
 #define SIGN_MODE_SOURCE_TEMPKEY    ((uint8_t)0x00)
@@ -164,6 +166,7 @@ typedef __xdata struct atecc_io
 
 void atecc_init(atecc_io_t *io_buf);
 bool atecc_wake();
+bool atecc_read_data(atecc_io_t *io_buf, uint8_t slot, uint8_t block, __xdata uint8_t *data);
 bool atecc_nonce(atecc_io_t *io_buf, __xdata const uint8_t *nonce);
 bool atecc_sign(atecc_io_t *io_buf, uint16_t key_id, __xdata uint8_t *signature);
 

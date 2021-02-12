@@ -5,6 +5,7 @@
 #include "glasgow.h"
 
 enum {
+  ATECC_OP_READ   = 0x02,
   ATECC_OP_NONCE   = 0x16,
   ATECC_OP_SIGN  = 0x41,
   ATECC_OP_GENKEY = 0x40,
@@ -108,8 +109,12 @@ static void atecc_delay(uint8_t opcode)
 	uint8_t delay = 0;
 	switch(opcode)
 	{
+    case ATECC_OP_READ:
+      delay = 5;
+      break;
     case ATECC_OP_NONCE:
       delay = 29;
+      break;
 		case ATECC_OP_SIGN:
 			//delay = 60; // 508A
       delay = 115; // 608A
@@ -130,6 +135,20 @@ bool atecc_send_recv(atecc_io_t *io_buf, uint8_t rxlen)
 	atecc_delay(io_buf->command.opcode);
   if (!atecc_recv(io_buf, rxlen))
     return false;
+  return true;
+}
+
+bool atecc_read_data(atecc_io_t *io_buf, uint8_t slot, uint8_t block, __xdata uint8_t *data)
+{
+  io_buf->command.opcode = ATECC_OP_READ;
+  io_buf->command.p1 = ZONE_DATA | ZONE_READWRITE_32;
+  io_buf->command.p2 = (uint16_t)block << 8 | slot << 3;
+  io_buf->len = 7;
+
+  if (!atecc_send_recv(io_buf, 35))
+    return false;
+
+  xmemcpy((__xdata void *)data, (__xdata void *)io_buf->data, 32);
   return true;
 }
 
