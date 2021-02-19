@@ -86,6 +86,13 @@ class SNSource(IntEnum):
 
 class SerialNumber(object):
 
+    def __init__(self, serial, sn_source):
+        self.serial = serial
+        self.source = sn_source
+
+    def __bytes__(self):
+        return bytes(self.serial)
+
     @classmethod
     def from_public_key(cls, pub_key, enc_dates):
         assert(isinstance(pub_key, ec.EllipticCurvePublicKey))
@@ -104,7 +111,7 @@ class SerialNumber(object):
         cert_sn = bytearray(digest.finalize())
         cert_sn[0] &= 0x7F
         cert_sn[0] |= 0x40
-        return cert_sn[:16]
+        return cls(cert_sn[:16], SNSource.SUBJECT_PUBKEY)
 
     @classmethod
     def from_source(cls, sn_source: SNSource, pub_key=None, enc_dates=None):
@@ -167,7 +174,7 @@ class CompressedCertificateBuilder(x509.CertificateBuilder):
         cert = (
             cls()
             .public_key(public_key)
-            .serial_number(int.from_bytes(serial_number, byteorder='big'))
+            .serial_number(int.from_bytes(bytes(serial_number), byteorder='big'))
             .not_valid_before(validity.not_valid_before)
             .not_valid_after(validity.not_valid_after)
             .add_extension(
@@ -189,6 +196,10 @@ class CompressedCertificateBuilder(x509.CertificateBuilder):
             cert = cert.subject_name(x509.Name([
                 x509.NameAttribute(NameOID.COMMON_NAME, signer_id.hex().upper())
             ]))
+            # order of extensions is important but is not specified
+            cert = cert.add_extension(
+                x509.BasicConstraints(ca=True, path_length=1), False
+            )
             # see https://github.com/MicrochipTech/cryptoauthlib/issues/153
             if issuer_name:
                 cert = cert.issuer_name(issuer_name)
@@ -229,85 +240,83 @@ class CompressedCertificateBuilder(x509.CertificateBuilder):
         return compressed_cert
 
 
-def cert_to_compressed(certificate):
-    pass
-
-class DeviceCertificateBuilder(x509.CertificateBuilder):
-    def __init__(self):
-        pass
-
-
-class DeviceCertificate(object):
-    pass
-
-class SignerCertificate(object):
-    pass
-
-
 import unittest
 
 
 class CertificateTestCase(unittest.TestCase):
 
-    x, y = (
-        int('961dc17cd422c282c93ada0e2e0bbcba34e07d3b29859c90dec7a8f576897f06', 16),
-        int('f89efa29a1a8ef39e003f97520c768015dc27b1fba755dad558ca3975aaa592d', 16)
-    )
-    point = ec.EllipticCurvePublicNumbers(x,y, ec.SECP256R1())
-    device_pubkey = point.public_key(default_backend())
+    def setUp(self):
+        x, y = (
+            int('961dc17cd422c282c93ada0e2e0bbcba34e07d3b29859c90dec7a8f576897f06', 16),
+            int('f89efa29a1a8ef39e003f97520c768015dc27b1fba755dad558ca3975aaa592d', 16)
+        )
+        point = ec.EllipticCurvePublicNumbers(x,y, ec.SECP256R1())
+        self.device_pubkey = point.public_key(default_backend())
 
-    def test_signer_cert(self):
-        root_key = ec.generate_private_key(
+        self.root_key = ec.derive_private_key(
+            0xaabbccdd,
             ec.SECP256R1(),
             backend=default_backend()
         )
+        self.signer_key = ec.derive_private_key(
+            0xff00ff00,
+            ec.SECP256R1(),
+            backend=default_backend()
+        )
+
+    def test_signer_cert(self):
+        root_key = self.root_key
         root_name = x509.Name([
             x509.NameAttribute(NameOID.COMMON_NAME, "GlasgowCA")
         ])
 
-        signer_key = ec.generate_private_key(
-            ec.SECP256R1(),
-            backend=default_backend()
-        )
+        signer_key = self.signer_key
         signer_name = x509.Name([
             x509.NameAttribute(NameOID.COMMON_NAME, "CCCC") # TODO: fix SSSS
         ])
         # path_len=0 means this cert can only sign itself, not other certs.
         basic_constraints = x509.BasicConstraints(ca=True, path_length=4)
-        valid_from = datetime(2019, 1, 1)
+        valid_from = datetime(2021, 1, 1)
+        signer_validity = Validity(valid_from, valid_from.replace(year=2030))
+        signer_serial_number = SerialNumber.from_source(SNSource.SUBJECT_PUBKEY, signer_key.public_key(), bytes(signer_validity))
 
         signer_cert_builder = CompressedCertificateBuilder(
             template_id=Template.SIGNER,
             issuer_name=root_name,
             subject_name=signer_name,
             public_key=signer_key.public_key(),
-            serial_number=1000,
-            not_valid_before=valid_from,
-            not_valid_after=valid_from.replace(year=2030),
-            extensions=[]
+            serial_number=int.from_bytes(signer_serial_number, byteorder='big'),
+            not_valid_before=signer_validity.not_valid_before,
+            not_valid_after=signer_validity.not_valid_after,
+            extensions=[
+                x509.Extension(x509.AuthorityKeyIdentifier.oid, False, x509.AuthorityKeyIdentifier.from_issuer_public_key(root_key.public_key())),
+                x509.Extension(x509.SubjectKeyIdentifier.oid, False, x509.SubjectKeyIdentifier.from_public_key(signer_key.public_key())),
+                x509.Extension(x509.BasicConstraints.oid, False, x509.BasicConstraints(ca=True, path_length=1)),
+            ]
         )
 
         signer_cert = signer_cert_builder.sign(root_key, hashes.SHA256(), default_backend())
         signer_compressed_cert = signer_cert_builder.sign_compressed(root_key, default_backend())
         signer_reconstructed_cert = CompressedCertificateBuilder.from_bytes(signer_compressed_cert, signer_key.public_key(), root_key.public_key(), issuer_name=root_name)
 
-        cert_pem = signer_reconstructed_cert.public_bytes(encoding=serialization.Encoding.PEM)
+        signer_pem = signer_reconstructed_cert.public_bytes(encoding=serialization.Encoding.PEM)
         with open("signer.pem", "wb") as f:
-            f.write(cert_pem)
+            f.write(signer_pem)
+        
+        signer_cert = x509.load_pem_x509_certificate(signer_pem)
+        self.root_key.public_key().verify(
+            signer_cert.signature,
+            signer_cert.tbs_certificate_bytes,
+            ec.ECDSA(signer_cert.signature_hash_algorithm),
+        )
 
     def test_device_cert(self):
-        root_key = ec.generate_private_key(
-            ec.SECP256R1(),
-            backend=default_backend()
-        )
+        root_key = self.root_key
         root_name = x509.Name([
             x509.NameAttribute(NameOID.COMMON_NAME, "GlasgowCA")
         ])
 
-        signer_key = ec.generate_private_key(
-            ec.SECP256R1(),
-            backend=default_backend()
-        )
+        signer_key = self.signer_key
         signer_name = x509.Name([
             x509.NameAttribute(NameOID.COMMON_NAME, "CCCC")
         ])
